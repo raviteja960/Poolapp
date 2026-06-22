@@ -1,0 +1,2406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#0a0a0a" />
+<title>CueTab — APA Pool League App</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+  :root { --accent: #22d3ee; --accent-dim: #0891b2; }
+  html, body { background: #09090b; color: #fafafa; font-family: 'Inter', system-ui, sans-serif; }
+  body { padding-bottom: env(safe-area-inset-bottom); }
+  input, select, textarea { font-family: inherit; }
+  input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+  input[type=number] { -moz-appearance: textfield; }
+  .accent { color: var(--accent); }
+  .accent-bg { background: var(--accent); }
+  .accent-border { border-color: var(--accent); }
+  .glow { box-shadow: 0 0 0 1px rgba(34,211,238,0.4), 0 0 12px rgba(34,211,238,0.15); }
+  .mono { font-family: 'JetBrains Mono', monospace; }
+  .field-input { background: #18181b; border: 1px solid #27272a; color: #fafafa; }
+  .field-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(34,211,238,0.15); }
+  .stepper-btn { background: #18181b; border: 1px solid #27272a; color: #d4d4d8; }
+  .stepper-btn:active { background: #27272a; }
+  .pill-toggle { transition: all 0.15s ease; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-thumb { background: #27272a; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="env,react">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+// ============= APA constants =============
+
+// 8-Ball race chart: race[YourSL][OppSL] = games you need
+// Sourced from APA 8-Ball race chart
+const EIGHT_BALL_RACE = {
+  2: { 2:2, 3:2, 4:2, 5:2, 6:2, 7:2 },
+  3: { 2:3, 3:2, 4:2, 5:2, 6:2, 7:2 },
+  4: { 2:4, 3:3, 4:3, 5:3, 6:3, 7:2 },
+  5: { 2:5, 3:4, 4:4, 5:4, 6:4, 7:3 },
+  6: { 2:6, 3:5, 4:5, 5:5, 6:5, 7:4 },
+  7: { 2:7, 3:6, 4:5, 5:5, 6:5, 7:5 },
+};
+
+// 9-Ball race by SL (ball points target)
+const NINE_BALL_RACE = { 1:14, 2:19, 3:25, 4:31, 5:38, 6:46, 7:55, 8:65, 9:75 };
+
+// 9-Ball match-point thresholds — ball points required for N match points (MP0..MP8)
+// Sourced from the APA9_Calc sheet
+const NINE_BALL_MP_TABLE = {
+  1: [0, 3, 4, 5, 7, 8, 9, 11, 12],
+  2: [0, 4, 6, 8, 9, 11, 13, 15, 17],
+  3: [0, 5, 7, 10, 12, 15, 17, 20, 22],
+  4: [0, 6, 9, 12, 15, 19, 22, 25, 28],
+  5: [0, 7, 11, 15, 19, 23, 27, 30, 34],
+  6: [0, 9, 13, 18, 23, 28, 32, 37, 41],
+  7: [0, 11, 16, 22, 27, 33, 38, 44, 50],
+  8: [0, 14, 20, 27, 33, 40, 46, 53, 59],
+  9: [0, 18, 25, 32, 39, 47, 54, 61, 68],
+};
+
+const computeNineBallMP = (sl, ballPoints, didWin) => {
+  if (didWin) return 20; // win bonus
+  const thresholds = NINE_BALL_MP_TABLE[sl] || [];
+  let mp = 0;
+  for (let i = thresholds.length - 1; i >= 0; i--) {
+    if (ballPoints >= thresholds[i]) { mp = i; break; }
+  }
+  return mp;
+};
+
+// 8-Ball match points (APA 0-3 scale, derived from observed patterns)
+const computeEightBallMP = (gamesWon, raceNeeded, didWin) => {
+  if (didWin) {
+    // Won: 2 or 3 based on dominance — if opp got fewer than half their race, full 3
+    return 3;
+  } else {
+    // Lost: 0-2 based on how many games you got
+    if (gamesWon === 0) return 0;
+    if (gamesWon >= raceNeeded - 1) return 2;
+    return 1;
+  }
+};
+
+const MATCH_TYPES = ['League', 'Tournament', 'Practice', 'Other'];
+const STORAGE_KEY = 'apa_tracker_matches_v1';
+const PROFILE_KEY = 'apa_tracker_profile_v1';
+const SEED_FLAG_KEY = 'apa_tracker_seeded_v1';
+const SESSIONS_KEY = 'apa_tracker_sessions_v1';
+const PAYMENTS_KEY = 'apa_tracker_payments_v1';
+const DEFAULT_DUES = 13;
+
+// Pre-loaded data from Ethan Ochoa's APA tracker (Match_Log_8B sheet)
+const SEED_MATCHES = [{"id":"renun5z3j","savedAt":"2026-06-15T16:20:31.472565Z","format":"8","date":"2026-05-27","matchType":"League","playerName":"Ethan Ochoa","teamName":"Rack Em'","playerSL":4,"oppName":"Joshua Kyllingstad","oppSL":4,"raceYou":3,"raceOpp":3,"gamesWon":1,"gamesOppWon":4,"matchResult":"L","apaPointsFor":0,"apaPointsAgainst":2,"innings":17,"yourDefShots":5,"oppDefShots":2,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":5,"closeMatch":false,"whatCost":"","notes":"","imported":true},{"id":"qip98q1zx","savedAt":"2026-06-15T16:20:31.472602Z","format":"8","date":"2026-05-27","matchType":"League","playerName":"Ethan Ochoa","teamName":"Rack Em'","playerSL":4,"oppName":"Ethan Hutcherson","oppSL":4,"raceYou":3,"raceOpp":3,"gamesWon":1,"gamesOppWon":4,"matchResult":"L","apaPointsFor":0,"apaPointsAgainst":2,"innings":27,"yourDefShots":3,"oppDefShots":1,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":5,"closeMatch":false,"whatCost":"","notes":"","imported":true},{"id":"r9oudocuz","savedAt":"2026-06-15T16:20:31.472529Z","format":"8","date":"2026-05-25","matchType":"League","playerName":"Ethan Ochoa","teamName":"Bank You, Next","playerSL":4,"oppName":"Kevin Caballero","oppSL":4,"raceYou":3,"raceOpp":3,"gamesWon":1,"gamesOppWon":3,"matchResult":"L","apaPointsFor":0,"apaPointsAgainst":2,"innings":23,"yourDefShots":4,"oppDefShots":2,"scratchOn8":1,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":5,"closeMatch":false,"whatCost":"","notes":"","imported":true},{"id":"nrek8pk3y","savedAt":"2026-06-15T16:20:31.472490Z","format":"8","date":"2026-05-14","matchType":"League","playerName":"Ethan Ochoa","teamName":"Rack Em'","playerSL":4,"oppName":"Mathew Blake","oppSL":5,"raceYou":3,"raceOpp":4,"gamesWon":2,"gamesOppWon":4,"matchResult":"L","apaPointsFor":1,"apaPointsAgainst":2,"innings":29,"yourDefShots":1,"oppDefShots":3,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":5,"closeMatch":true,"whatCost":"","notes":"","imported":true},{"id":"ogyr3xkxw","savedAt":"2026-06-15T16:20:31.472452Z","format":"8","date":"2026-05-11","matchType":"League","playerName":"Ethan Ochoa","teamName":"Bank You, Next","playerSL":4,"oppName":"Chris Hartland","oppSL":3,"raceYou":3,"raceOpp":2,"gamesWon":3,"gamesOppWon":0,"matchResult":"W","apaPointsFor":3,"apaPointsAgainst":0,"innings":13,"yourDefShots":0,"oppDefShots":0,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":1,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":5,"closeMatch":false,"whatCost":"","notes":"","imported":true},{"id":"9sxmecosf","savedAt":"2026-06-15T16:20:31.472414Z","format":"8","date":"2026-05-07","matchType":"League","playerName":"Ethan Ochoa","teamName":"Rack Em'","playerSL":4,"oppName":"Rose Lucero","oppSL":4,"raceYou":3,"raceOpp":3,"gamesWon":2,"gamesOppWon":3,"matchResult":"L","apaPointsFor":1,"apaPointsAgainst":2,"innings":32,"yourDefShots":2,"oppDefShots":0,"scratchOn8":1,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":5,"closeMatch":true,"whatCost":"","notes":"","imported":true},{"id":"wwqc38hyf","savedAt":"2026-06-15T16:20:31.472374Z","format":"8","date":"2026-05-04","matchType":"League","playerName":"Ethan Ochoa","teamName":"Bank You, Next","playerSL":4,"oppName":"Nikki Heath","oppSL":4,"raceYou":3,"raceOpp":3,"gamesWon":1,"gamesOppWon":3,"matchResult":"L","apaPointsFor":0,"apaPointsAgainst":2,"innings":19,"yourDefShots":1,"oppDefShots":2,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":5,"closeMatch":false,"whatCost":"","notes":"","imported":true},{"id":"vrjnvgfyg","savedAt":"2026-06-15T16:20:31.472333Z","format":"8","date":"2026-04-30","matchType":"League","playerName":"Ethan Ochoa","teamName":"Rack Em'","playerSL":4,"oppName":"Nick Howland","oppSL":4,"raceYou":3,"raceOpp":3,"gamesWon":3,"gamesOppWon":1,"matchResult":"W","apaPointsFor":2,"apaPointsAgainst":0,"innings":21,"yourDefShots":1,"oppDefShots":1,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":5,"closeMatch":false,"whatCost":"","notes":"","imported":true},{"id":"m80o2rak1","savedAt":"2026-06-15T16:20:31.472290Z","format":"8","date":"2026-04-27","matchType":"League","playerName":"Ethan Ochoa","teamName":"Bank You, Next","playerSL":4,"oppName":"Alyssa Herron","oppSL":2,"raceYou":4,"raceOpp":2,"gamesWon":4,"gamesOppWon":0,"matchResult":"W","apaPointsFor":3,"apaPointsAgainst":0,"innings":27,"yourDefShots":1,"oppDefShots":0,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":1,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":5,"closeMatch":false,"whatCost":"","notes":"","imported":true},{"id":"1cbfno6b9","savedAt":"2026-06-15T16:20:31.472239Z","format":"8","date":"2026-04-23","matchType":"League","playerName":"Ethan Ochoa","teamName":"Rack Em'","playerSL":4,"oppName":"Randy Swenson","oppSL":7,"raceYou":2,"raceOpp":5,"gamesWon":1,"gamesOppWon":5,"matchResult":"L","apaPointsFor":1,"apaPointsAgainst":2,"innings":0,"yourDefShots":0,"oppDefShots":0,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":5,"closeMatch":true,"whatCost":"","notes":"","imported":true},{"id":"hbrpoig8f","savedAt":"2026-06-15T16:20:31.472102Z","format":"8","date":"2026-04-20","matchType":"League","playerName":"Ethan Ochoa","teamName":"Bank You, Next","playerSL":4,"oppName":"Than Hutchersom","oppSL":4,"raceYou":3,"raceOpp":3,"gamesWon":0,"gamesOppWon":3,"matchResult":"L","apaPointsFor":0,"apaPointsAgainst":3,"innings":8,"yourDefShots":0,"oppDefShots":1,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":2,"missedPosition":3,"poorSafety":2,"mentalFocus":5,"closeMatch":false,"whatCost":"","notes":"","imported":true}];
+const SEED_PROFILE = { name: 'Ethan Ochoa', team: 'Bank You, Next', role: 'captain', dues: 13 };
+
+// Additional sample data: night sessions, payments, and extra match records for teammates + 9-Ball
+const EXTRA_SEED_MATCHES = [{"id":"9vvdkiv9v","savedAt":"2026-06-15T16:42:59.613526Z","format":"8","date":"2026-05-13","matchType":"League","playerName":"Ethan Ochoa","teamName":"Bank You, Next","playerSL":4,"oppName":"Mike Ross","oppSL":4,"raceYou":3,"raceOpp":3,"gamesWon":3,"gamesOppWon":1,"matchResult":"W","apaPointsFor":3,"apaPointsAgainst":1,"innings":20,"yourDefShots":1,"oppDefShots":0,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":7,"closeMatch":false,"whatCost":"","notes":"Night: vs Cue Tip Crew","sessionId":"drf0rgcy8"},{"id":"fyeau2gcf","savedAt":"2026-06-15T16:42:59.613557Z","format":"8","date":"2026-05-13","matchType":"League","playerName":"Marcus Reed","teamName":"Bank You, Next","playerSL":5,"oppName":"Steve Allen","oppSL":5,"raceYou":4,"raceOpp":4,"gamesWon":3,"gamesOppWon":4,"matchResult":"L","apaPointsFor":2,"apaPointsAgainst":3,"innings":17,"yourDefShots":1,"oppDefShots":0,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":6,"closeMatch":true,"whatCost":"","notes":"Night: vs Cue Tip Crew","sessionId":"drf0rgcy8"},{"id":"14q4ctv74","savedAt":"2026-06-15T16:42:59.613573Z","format":"8","date":"2026-05-13","matchType":"League","playerName":"Sofia Vargas","teamName":"Bank You, Next","playerSL":3,"oppName":"Pam Liu","oppSL":3,"raceYou":2,"raceOpp":2,"gamesWon":2,"gamesOppWon":1,"matchResult":"W","apaPointsFor":3,"apaPointsAgainst":2,"innings":19,"yourDefShots":4,"oppDefShots":4,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":8,"closeMatch":false,"whatCost":"","notes":"Night: vs Cue Tip Crew","sessionId":"drf0rgcy8"},{"id":"uaz618570","savedAt":"2026-06-15T16:42:59.613588Z","format":"8","date":"2026-05-13","matchType":"League","playerName":"Daniel Park","teamName":"Bank You, Next","playerSL":6,"oppName":"Ben Carter","oppSL":6,"raceYou":5,"raceOpp":5,"gamesWon":5,"gamesOppWon":2,"matchResult":"W","apaPointsFor":3,"apaPointsAgainst":1,"innings":24,"yourDefShots":4,"oppDefShots":0,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":5,"closeMatch":false,"whatCost":"","notes":"Night: vs Cue Tip Crew","sessionId":"drf0rgcy8"},{"id":"f5qkvv9ze","savedAt":"2026-06-15T16:42:59.613600Z","format":"8","date":"2026-05-13","matchType":"League","playerName":"Lisa Tran","teamName":"Bank You, Next","playerSL":4,"oppName":"Maria Lopez","oppSL":4,"raceYou":3,"raceOpp":3,"gamesWon":2,"gamesOppWon":3,"matchResult":"L","apaPointsFor":2,"apaPointsAgainst":3,"innings":27,"yourDefShots":3,"oppDefShots":4,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":6,"closeMatch":true,"whatCost":"","notes":"Night: vs Cue Tip Crew","sessionId":"drf0rgcy8"},{"id":"6ds5o84lj","savedAt":"2026-06-15T16:42:59.613657Z","format":"8","date":"2026-05-20","matchType":"League","playerName":"Ethan Ochoa","teamName":"Bank You, Next","playerSL":4,"oppName":"Tom King","oppSL":5,"raceYou":3,"raceOpp":4,"gamesWon":1,"gamesOppWon":3,"matchResult":"-","apaPointsFor":0,"apaPointsAgainst":0,"innings":27,"yourDefShots":3,"oppDefShots":3,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":4,"closeMatch":false,"whatCost":"","notes":"Night: vs Eight Is Enough","sessionId":"bmfxawoz8"},{"id":"ai3mbqwr1","savedAt":"2026-06-15T16:42:59.613674Z","format":"8","date":"2026-05-20","matchType":"League","playerName":"Marcus Reed","teamName":"Bank You, Next","playerSL":5,"oppName":"Chuck Wells","oppSL":5,"raceYou":4,"raceOpp":4,"gamesWon":2,"gamesOppWon":4,"matchResult":"L","apaPointsFor":1,"apaPointsAgainst":3,"innings":26,"yourDefShots":0,"oppDefShots":0,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":8,"closeMatch":true,"whatCost":"","notes":"Night: vs Eight Is Enough","sessionId":"bmfxawoz8"},{"id":"e6wff1a8y","savedAt":"2026-06-15T16:42:59.613686Z","format":"8","date":"2026-05-20","matchType":"League","playerName":"Alyssa Herron","teamName":"Bank You, Next","playerSL":2,"oppName":"Hannah Ford","oppSL":3,"raceYou":2,"raceOpp":3,"gamesWon":0,"gamesOppWon":2,"matchResult":"-","apaPointsFor":0,"apaPointsAgainst":0,"innings":15,"yourDefShots":4,"oppDefShots":3,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":4,"closeMatch":false,"whatCost":"","notes":"Night: vs Eight Is Enough","sessionId":"bmfxawoz8"},{"id":"uq4c9v0wb","savedAt":"2026-06-15T16:42:59.613697Z","format":"8","date":"2026-05-20","matchType":"League","playerName":"Daniel Park","teamName":"Bank You, Next","playerSL":6,"oppName":"Frank Lim","oppSL":6,"raceYou":5,"raceOpp":5,"gamesWon":5,"gamesOppWon":3,"matchResult":"W","apaPointsFor":3,"apaPointsAgainst":1,"innings":18,"yourDefShots":3,"oppDefShots":0,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":5,"closeMatch":false,"whatCost":"","notes":"Night: vs Eight Is Enough","sessionId":"bmfxawoz8"},{"id":"xpfd7y8tj","savedAt":"2026-06-15T16:42:59.613709Z","format":"8","date":"2026-05-20","matchType":"League","playerName":"Jake Morrison","teamName":"Bank You, Next","playerSL":2,"oppName":"Will Brown","oppSL":3,"raceYou":2,"raceOpp":3,"gamesWon":1,"gamesOppWon":2,"matchResult":"-","apaPointsFor":0,"apaPointsAgainst":0,"innings":22,"yourDefShots":3,"oppDefShots":2,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":5,"closeMatch":false,"whatCost":"","notes":"Night: vs Eight Is Enough","sessionId":"bmfxawoz8"},{"id":"3bw22t1bk","savedAt":"2026-06-15T16:42:59.613729Z","format":"8","date":"2026-05-26","matchType":"League","playerName":"Ethan Ochoa","teamName":"Bank You, Next","playerSL":4,"oppName":"Nina Patel","oppSL":4,"raceYou":3,"raceOpp":3,"gamesWon":2,"gamesOppWon":3,"matchResult":"L","apaPointsFor":2,"apaPointsAgainst":3,"innings":23,"yourDefShots":4,"oppDefShots":4,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":8,"closeMatch":true,"whatCost":"","notes":"Night: vs Stripes & Solids","sessionId":"8v7hky1di"},{"id":"iv6g8xovf","savedAt":"2026-06-15T16:42:59.613740Z","format":"8","date":"2026-05-26","matchType":"League","playerName":"Marcus Reed","teamName":"Bank You, Next","playerSL":5,"oppName":"Dale Hunt","oppSL":4,"raceYou":4,"raceOpp":3,"gamesWon":4,"gamesOppWon":3,"matchResult":"W","apaPointsFor":3,"apaPointsAgainst":2,"innings":21,"yourDefShots":4,"oppDefShots":1,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":5,"closeMatch":true,"whatCost":"","notes":"Night: vs Stripes & Solids","sessionId":"8v7hky1di"},{"id":"uqzc6fm6m","savedAt":"2026-06-15T16:42:59.613751Z","format":"8","date":"2026-05-26","matchType":"League","playerName":"Sofia Vargas","teamName":"Bank You, Next","playerSL":3,"oppName":"Eve Sims","oppSL":3,"raceYou":2,"raceOpp":2,"gamesWon":2,"gamesOppWon":1,"matchResult":"W","apaPointsFor":3,"apaPointsAgainst":2,"innings":13,"yourDefShots":1,"oppDefShots":2,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":8,"closeMatch":false,"whatCost":"","notes":"Night: vs Stripes & Solids","sessionId":"8v7hky1di"},{"id":"ofufv98i8","savedAt":"2026-06-15T16:42:59.613765Z","format":"8","date":"2026-05-26","matchType":"League","playerName":"Daniel Park","teamName":"Bank You, Next","playerSL":6,"oppName":"Roger Tate","oppSL":5,"raceYou":5,"raceOpp":4,"gamesWon":5,"gamesOppWon":2,"matchResult":"W","apaPointsFor":3,"apaPointsAgainst":1,"innings":17,"yourDefShots":3,"oppDefShots":3,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":7,"closeMatch":false,"whatCost":"","notes":"Night: vs Stripes & Solids","sessionId":"8v7hky1di"},{"id":"bq5vzo6ia","savedAt":"2026-06-15T16:42:59.613776Z","format":"8","date":"2026-05-26","matchType":"League","playerName":"Lisa Tran","teamName":"Bank You, Next","playerSL":4,"oppName":"Karen Wu","oppSL":4,"raceYou":3,"raceOpp":3,"gamesWon":3,"gamesOppWon":1,"matchResult":"W","apaPointsFor":3,"apaPointsAgainst":1,"innings":28,"yourDefShots":2,"oppDefShots":4,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":4,"closeMatch":false,"whatCost":"","notes":"Night: vs Stripes & Solids","sessionId":"8v7hky1di"},{"id":"vmlyd0y6q","savedAt":"2026-06-15T16:42:59.613798Z","format":"9","date":"2026-06-03","matchType":"League","playerName":"Ethan Ochoa","teamName":"Bank You, Next","playerSL":5,"oppName":"Pete Hall","oppSL":5,"raceYou":38,"raceOpp":38,"yourBallPoints":38,"oppBallPoints":19,"deadBalls":1,"racksStarted":12,"matchResult":"W","apaPointsFor":20,"apaPointsAgainst":4,"innings":27,"yourDefShots":2,"oppDefShots":0,"nineOnSnap":0,"breakAndRun":0,"closeMatch":false,"notes":"Night: vs Cue Crew","sessionId":"dx3x0uwn2"},{"id":"q6udydytg","savedAt":"2026-06-15T16:42:59.613815Z","format":"9","date":"2026-06-03","matchType":"League","playerName":"Marcus Reed","teamName":"Bank You, Next","playerSL":6,"oppName":"Bob Lee","oppSL":6,"raceYou":46,"raceOpp":46,"yourBallPoints":30,"oppBallPoints":46,"deadBalls":3,"racksStarted":10,"matchResult":"L","apaPointsFor":5,"apaPointsAgainst":20,"innings":25,"yourDefShots":1,"oppDefShots":5,"nineOnSnap":0,"breakAndRun":0,"closeMatch":false,"notes":"Night: vs Cue Crew","sessionId":"dx3x0uwn2"},{"id":"wp36rvdlh","savedAt":"2026-06-15T16:42:59.613836Z","format":"9","date":"2026-06-03","matchType":"League","playerName":"Sofia Vargas","teamName":"Bank You, Next","playerSL":3,"oppName":"Eve Park","oppSL":3,"raceYou":25,"raceOpp":25,"yourBallPoints":25,"oppBallPoints":12,"deadBalls":0,"racksStarted":9,"matchResult":"W","apaPointsFor":20,"apaPointsAgainst":4,"innings":30,"yourDefShots":5,"oppDefShots":1,"nineOnSnap":0,"breakAndRun":1,"closeMatch":false,"notes":"Night: vs Cue Crew","sessionId":"dx3x0uwn2"},{"id":"8juxoc36s","savedAt":"2026-06-15T16:42:59.613856Z","format":"9","date":"2026-06-03","matchType":"League","playerName":"Daniel Park","teamName":"Bank You, Next","playerSL":7,"oppName":"Roy Glass","oppSL":6,"raceYou":55,"raceOpp":46,"yourBallPoints":55,"oppBallPoints":22,"deadBalls":0,"racksStarted":8,"matchResult":"W","apaPointsFor":20,"apaPointsAgainst":3,"innings":27,"yourDefShots":1,"oppDefShots":5,"nineOnSnap":0,"breakAndRun":0,"closeMatch":false,"notes":"Night: vs Cue Crew","sessionId":"dx3x0uwn2"},{"id":"sk0w1ca5k","savedAt":"2026-06-15T16:42:59.613876Z","format":"9","date":"2026-06-03","matchType":"League","playerName":"Lisa Tran","teamName":"Bank You, Next","playerSL":4,"oppName":"Joy Kim","oppSL":4,"raceYou":31,"raceOpp":31,"yourBallPoints":24,"oppBallPoints":31,"deadBalls":1,"racksStarted":6,"matchResult":"L","apaPointsFor":6,"apaPointsAgainst":20,"innings":23,"yourDefShots":4,"oppDefShots":1,"nineOnSnap":0,"breakAndRun":0,"closeMatch":true,"notes":"Night: vs Cue Crew","sessionId":"dx3x0uwn2"},{"id":"289rm7ez0","savedAt":"2026-06-15T16:42:59.613897Z","format":"8","date":"2026-06-15","matchType":"League","playerName":"Ethan Ochoa","teamName":"Bank You, Next","playerSL":4,"oppName":"Bryan Wells","oppSL":5,"raceYou":3,"raceOpp":4,"gamesWon":3,"gamesOppWon":2,"matchResult":"W","apaPointsFor":3,"apaPointsAgainst":1,"innings":27,"yourDefShots":0,"oppDefShots":0,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":8,"closeMatch":true,"whatCost":"","notes":"Night: vs Pool Sharks","sessionId":"mt53os7fg"},{"id":"117wj5imn","savedAt":"2026-06-15T16:42:59.613917Z","format":"8","date":"2026-06-15","matchType":"League","playerName":"Sofia Vargas","teamName":"Bank You, Next","playerSL":3,"oppName":"Mike Day","oppSL":3,"raceYou":2,"raceOpp":2,"gamesWon":1,"gamesOppWon":2,"matchResult":"L","apaPointsFor":2,"apaPointsAgainst":3,"innings":20,"yourDefShots":0,"oppDefShots":1,"scratchOn8":0,"eightOnBreak":0,"breakAndRun":0,"rackless":0,"missedEasy":0,"missedPosition":0,"poorSafety":0,"mentalFocus":5,"closeMatch":false,"whatCost":"","notes":"Night: vs Pool Sharks","sessionId":"mt53os7fg"},{"id":"ezba0u9bc","savedAt":"2026-06-15T16:42:59.613945Z","format":"9","date":"2026-05-22","matchType":"Practice","playerName":"Ethan Ochoa","teamName":"Bank You, Next","playerSL":5,"oppName":"Chris Tan","oppSL":5,"raceYou":38,"raceOpp":38,"yourBallPoints":38,"oppBallPoints":24,"deadBalls":1,"racksStarted":11,"matchResult":"W","apaPointsFor":20,"apaPointsAgainst":5,"innings":28,"yourDefShots":5,"oppDefShots":2,"nineOnSnap":0,"breakAndRun":0,"closeMatch":false,"notes":"Practice match"},{"id":"sun6bxj3o","savedAt":"2026-06-15T16:42:59.613959Z","format":"9","date":"2026-05-30","matchType":"Practice","playerName":"Ethan Ochoa","teamName":"Bank You, Next","playerSL":5,"oppName":"Pat Reyes","oppSL":6,"raceYou":38,"raceOpp":46,"yourBallPoints":32,"oppBallPoints":46,"deadBalls":3,"racksStarted":7,"matchResult":"L","apaPointsFor":7,"apaPointsAgainst":20,"innings":28,"yourDefShots":3,"oppDefShots":4,"nineOnSnap":0,"breakAndRun":1,"closeMatch":true,"notes":"Practice match"},{"id":"5csi4gih3","savedAt":"2026-06-15T16:42:59.613972Z","format":"9","date":"2026-06-08","matchType":"Practice","playerName":"Ethan Ochoa","teamName":"Bank You, Next","playerSL":5,"oppName":"Dana Wood","oppSL":4,"raceYou":38,"raceOpp":31,"yourBallPoints":38,"oppBallPoints":18,"deadBalls":2,"racksStarted":10,"matchResult":"W","apaPointsFor":20,"apaPointsAgainst":4,"innings":15,"yourDefShots":3,"oppDefShots":4,"nineOnSnap":0,"breakAndRun":0,"closeMatch":false,"notes":"Practice match"}];
+const SEED_SESSIONS = [{"id":"drf0rgcy8","teamName":"Bank You, Next","opponentTeam":"Cue Tip Crew","date":"2026-05-13","format":"8","venue":"Bullshooters","status":"complete","slots":[{"slot":1,"playerName":"Ethan Ochoa","playerSL":4,"oppName":"Mike Ross","oppSL":4,"gamesWon":3,"gamesOppWon":1,"yourBallPoints":0,"oppBallPoints":0,"result":"W","apaPointsFor":3,"apaPointsAgainst":1,"completed":true,"matchId":"9vvdkiv9v"},{"slot":2,"playerName":"Marcus Reed","playerSL":5,"oppName":"Steve Allen","oppSL":5,"gamesWon":3,"gamesOppWon":4,"yourBallPoints":0,"oppBallPoints":0,"result":"L","apaPointsFor":2,"apaPointsAgainst":3,"completed":true,"matchId":"fyeau2gcf"},{"slot":3,"playerName":"Sofia Vargas","playerSL":3,"oppName":"Pam Liu","oppSL":3,"gamesWon":2,"gamesOppWon":1,"yourBallPoints":0,"oppBallPoints":0,"result":"W","apaPointsFor":3,"apaPointsAgainst":2,"completed":true,"matchId":"14q4ctv74"},{"slot":4,"playerName":"Daniel Park","playerSL":6,"oppName":"Ben Carter","oppSL":6,"gamesWon":5,"gamesOppWon":2,"yourBallPoints":0,"oppBallPoints":0,"result":"W","apaPointsFor":3,"apaPointsAgainst":1,"completed":true,"matchId":"uaz618570"},{"slot":5,"playerName":"Lisa Tran","playerSL":4,"oppName":"Maria Lopez","oppSL":4,"gamesWon":2,"gamesOppWon":3,"yourBallPoints":0,"oppBallPoints":0,"result":"L","apaPointsFor":2,"apaPointsAgainst":3,"completed":true,"matchId":"f5qkvv9ze"}],"createdAt":"2026-06-15T16:42:59.613637Z"},{"id":"bmfxawoz8","teamName":"Bank You, Next","opponentTeam":"Eight Is Enough","date":"2026-05-20","format":"8","venue":"Mavericks","status":"complete","slots":[{"slot":1,"playerName":"Ethan Ochoa","playerSL":4,"oppName":"Tom King","oppSL":5,"gamesWon":1,"gamesOppWon":3,"yourBallPoints":0,"oppBallPoints":0,"result":"-","apaPointsFor":0,"apaPointsAgainst":0,"completed":true,"matchId":"6ds5o84lj"},{"slot":2,"playerName":"Marcus Reed","playerSL":5,"oppName":"Chuck Wells","oppSL":5,"gamesWon":2,"gamesOppWon":4,"yourBallPoints":0,"oppBallPoints":0,"result":"L","apaPointsFor":1,"apaPointsAgainst":3,"completed":true,"matchId":"ai3mbqwr1"},{"slot":3,"playerName":"Alyssa Herron","playerSL":2,"oppName":"Hannah Ford","oppSL":3,"gamesWon":0,"gamesOppWon":2,"yourBallPoints":0,"oppBallPoints":0,"result":"-","apaPointsFor":0,"apaPointsAgainst":0,"completed":true,"matchId":"e6wff1a8y"},{"slot":4,"playerName":"Daniel Park","playerSL":6,"oppName":"Frank Lim","oppSL":6,"gamesWon":5,"gamesOppWon":3,"yourBallPoints":0,"oppBallPoints":0,"result":"W","apaPointsFor":3,"apaPointsAgainst":1,"completed":true,"matchId":"uq4c9v0wb"},{"slot":5,"playerName":"Jake Morrison","playerSL":2,"oppName":"Will Brown","oppSL":3,"gamesWon":1,"gamesOppWon":2,"yourBallPoints":0,"oppBallPoints":0,"result":"-","apaPointsFor":0,"apaPointsAgainst":0,"completed":true,"matchId":"xpfd7y8tj"}],"createdAt":"2026-06-15T16:42:59.613715Z"},{"id":"8v7hky1di","teamName":"Bank You, Next","opponentTeam":"Stripes & Solids","date":"2026-05-26","format":"8","venue":"Bullshooters","status":"complete","slots":[{"slot":1,"playerName":"Ethan Ochoa","playerSL":4,"oppName":"Nina Patel","oppSL":4,"gamesWon":2,"gamesOppWon":3,"yourBallPoints":0,"oppBallPoints":0,"result":"L","apaPointsFor":2,"apaPointsAgainst":3,"completed":true,"matchId":"3bw22t1bk"},{"slot":2,"playerName":"Marcus Reed","playerSL":5,"oppName":"Dale Hunt","oppSL":4,"gamesWon":4,"gamesOppWon":3,"yourBallPoints":0,"oppBallPoints":0,"result":"W","apaPointsFor":3,"apaPointsAgainst":2,"completed":true,"matchId":"iv6g8xovf"},{"slot":3,"playerName":"Sofia Vargas","playerSL":3,"oppName":"Eve Sims","oppSL":3,"gamesWon":2,"gamesOppWon":1,"yourBallPoints":0,"oppBallPoints":0,"result":"W","apaPointsFor":3,"apaPointsAgainst":2,"completed":true,"matchId":"uqzc6fm6m"},{"slot":4,"playerName":"Daniel Park","playerSL":6,"oppName":"Roger Tate","oppSL":5,"gamesWon":5,"gamesOppWon":2,"yourBallPoints":0,"oppBallPoints":0,"result":"W","apaPointsFor":3,"apaPointsAgainst":1,"completed":true,"matchId":"ofufv98i8"},{"slot":5,"playerName":"Lisa Tran","playerSL":4,"oppName":"Karen Wu","oppSL":4,"gamesWon":3,"gamesOppWon":1,"yourBallPoints":0,"oppBallPoints":0,"result":"W","apaPointsFor":3,"apaPointsAgainst":1,"completed":true,"matchId":"bq5vzo6ia"}],"createdAt":"2026-06-15T16:42:59.613781Z"},{"id":"dx3x0uwn2","teamName":"Bank You, Next","opponentTeam":"Cue Crew","date":"2026-06-03","format":"9","venue":"Mavericks","status":"complete","slots":[{"slot":1,"playerName":"Ethan Ochoa","playerSL":5,"oppName":"Pete Hall","oppSL":5,"gamesWon":0,"gamesOppWon":0,"yourBallPoints":38,"oppBallPoints":19,"result":"W","apaPointsFor":20,"apaPointsAgainst":4,"completed":true,"matchId":"vmlyd0y6q"},{"slot":2,"playerName":"Marcus Reed","playerSL":6,"oppName":"Bob Lee","oppSL":6,"gamesWon":0,"gamesOppWon":0,"yourBallPoints":30,"oppBallPoints":46,"result":"L","apaPointsFor":5,"apaPointsAgainst":20,"completed":true,"matchId":"q6udydytg"},{"slot":3,"playerName":"Sofia Vargas","playerSL":3,"oppName":"Eve Park","oppSL":3,"gamesWon":0,"gamesOppWon":0,"yourBallPoints":25,"oppBallPoints":12,"result":"W","apaPointsFor":20,"apaPointsAgainst":4,"completed":true,"matchId":"wp36rvdlh"},{"slot":4,"playerName":"Daniel Park","playerSL":7,"oppName":"Roy Glass","oppSL":6,"gamesWon":0,"gamesOppWon":0,"yourBallPoints":55,"oppBallPoints":22,"result":"W","apaPointsFor":20,"apaPointsAgainst":3,"completed":true,"matchId":"8juxoc36s"},{"slot":5,"playerName":"Lisa Tran","playerSL":4,"oppName":"Joy Kim","oppSL":4,"gamesWon":0,"gamesOppWon":0,"yourBallPoints":24,"oppBallPoints":31,"result":"L","apaPointsFor":6,"apaPointsAgainst":20,"completed":true,"matchId":"sk0w1ca5k"}],"createdAt":"2026-06-15T16:42:59.613883Z"},{"id":"mt53os7fg","teamName":"Bank You, Next","opponentTeam":"Pool Sharks","date":"2026-06-15","format":"8","venue":"Bullshooters","status":"in_progress","slots":[{"slot":1,"playerName":"Ethan Ochoa","playerSL":4,"oppName":"Bryan Wells","oppSL":5,"gamesWon":3,"gamesOppWon":2,"yourBallPoints":0,"oppBallPoints":0,"result":"W","apaPointsFor":3,"apaPointsAgainst":1,"completed":true,"matchId":"289rm7ez0"},{"slot":2,"playerName":"Sofia Vargas","playerSL":3,"oppName":"Mike Day","oppSL":3,"gamesWon":1,"gamesOppWon":2,"yourBallPoints":0,"oppBallPoints":0,"result":"L","apaPointsFor":2,"apaPointsAgainst":3,"completed":true,"matchId":"117wj5imn"},{"slot":3,"playerName":"","playerSL":null,"oppName":"","oppSL":null,"gamesWon":0,"gamesOppWon":0,"yourBallPoints":0,"oppBallPoints":0,"result":"-","apaPointsFor":0,"apaPointsAgainst":0,"completed":false,"matchId":null},{"slot":4,"playerName":"","playerSL":null,"oppName":"","oppSL":null,"gamesWon":0,"gamesOppWon":0,"yourBallPoints":0,"oppBallPoints":0,"result":"-","apaPointsFor":0,"apaPointsAgainst":0,"completed":false,"matchId":null},{"slot":5,"playerName":"","playerSL":null,"oppName":"","oppSL":null,"gamesWon":0,"gamesOppWon":0,"yourBallPoints":0,"oppBallPoints":0,"result":"-","apaPointsFor":0,"apaPointsAgainst":0,"completed":false,"matchId":null}],"createdAt":"2026-06-15T16:42:59.613931Z"}];
+const SEED_PAYMENTS = [{"id":"ydg6gufny","sessionId":"drf0rgcy8","sessionDate":"2026-05-13","teamName":"Bank You, Next","playerName":"Ethan Ochoa","amount":13,"paid":true,"method":"cash","paidAt":"2026-06-15T16:42:59.613989Z","createdAt":"2026-06-15T16:42:59.613990Z"},{"id":"l0i4iakfv","sessionId":"drf0rgcy8","sessionDate":"2026-05-13","teamName":"Bank You, Next","playerName":"Marcus Reed","amount":13,"paid":true,"method":"cash","paidAt":"2026-06-15T16:42:59.613998Z","createdAt":"2026-06-15T16:42:59.614000Z"},{"id":"cgjo31mzd","sessionId":"drf0rgcy8","sessionDate":"2026-05-13","teamName":"Bank You, Next","playerName":"Sofia Vargas","amount":13,"paid":true,"method":"venmo","paidAt":"2026-06-15T16:42:59.614007Z","createdAt":"2026-06-15T16:42:59.614008Z"},{"id":"djh3ficw2","sessionId":"drf0rgcy8","sessionDate":"2026-05-13","teamName":"Bank You, Next","playerName":"Daniel Park","amount":13,"paid":true,"method":"cash","paidAt":"2026-06-15T16:42:59.614015Z","createdAt":"2026-06-15T16:42:59.614016Z"},{"id":"npp1vjfas","sessionId":"drf0rgcy8","sessionDate":"2026-05-13","teamName":"Bank You, Next","playerName":"Lisa Tran","amount":13,"paid":true,"method":"cash","paidAt":"2026-06-15T16:42:59.614022Z","createdAt":"2026-06-15T16:42:59.614024Z"},{"id":"uzwodd9eh","sessionId":"bmfxawoz8","sessionDate":"2026-05-20","teamName":"Bank You, Next","playerName":"Ethan Ochoa","amount":13,"paid":true,"method":"cash","paidAt":"2026-06-15T16:42:59.614031Z","createdAt":"2026-06-15T16:42:59.614032Z"},{"id":"pspi9a8q0","sessionId":"bmfxawoz8","sessionDate":"2026-05-20","teamName":"Bank You, Next","playerName":"Marcus Reed","amount":13,"paid":false,"method":"","paidAt":null,"createdAt":"2026-06-15T16:42:59.614039Z"},{"id":"9xxi0cswu","sessionId":"bmfxawoz8","sessionDate":"2026-05-20","teamName":"Bank You, Next","playerName":"Alyssa Herron","amount":13,"paid":true,"method":"venmo","paidAt":"2026-06-15T16:42:59.614047Z","createdAt":"2026-06-15T16:42:59.614049Z"},{"id":"aw6asfylu","sessionId":"bmfxawoz8","sessionDate":"2026-05-20","teamName":"Bank You, Next","playerName":"Daniel Park","amount":13,"paid":true,"method":"cash","paidAt":"2026-06-15T16:42:59.614057Z","createdAt":"2026-06-15T16:42:59.614058Z"},{"id":"2g8mzemnw","sessionId":"bmfxawoz8","sessionDate":"2026-05-20","teamName":"Bank You, Next","playerName":"Jake Morrison","amount":13,"paid":false,"method":"","paidAt":null,"createdAt":"2026-06-15T16:42:59.614065Z"},{"id":"14s98kybq","sessionId":"8v7hky1di","sessionDate":"2026-05-26","teamName":"Bank You, Next","playerName":"Ethan Ochoa","amount":13,"paid":true,"method":"cash","paidAt":"2026-06-15T16:42:59.614073Z","createdAt":"2026-06-15T16:42:59.614074Z"},{"id":"bkmxlgigr","sessionId":"8v7hky1di","sessionDate":"2026-05-26","teamName":"Bank You, Next","playerName":"Marcus Reed","amount":13,"paid":true,"method":"zelle","paidAt":"2026-06-15T16:42:59.614081Z","createdAt":"2026-06-15T16:42:59.614082Z"},{"id":"hexdqxiq0","sessionId":"8v7hky1di","sessionDate":"2026-05-26","teamName":"Bank You, Next","playerName":"Sofia Vargas","amount":13,"paid":true,"method":"venmo","paidAt":"2026-06-15T16:42:59.614089Z","createdAt":"2026-06-15T16:42:59.614090Z"},{"id":"fq79h8hvs","sessionId":"8v7hky1di","sessionDate":"2026-05-26","teamName":"Bank You, Next","playerName":"Daniel Park","amount":13,"paid":false,"method":"","paidAt":null,"createdAt":"2026-06-15T16:42:59.614096Z"},{"id":"t2pafhg2y","sessionId":"8v7hky1di","sessionDate":"2026-05-26","teamName":"Bank You, Next","playerName":"Lisa Tran","amount":13,"paid":true,"method":"cash","paidAt":"2026-06-15T16:42:59.614103Z","createdAt":"2026-06-15T16:42:59.614104Z"},{"id":"wliya0npa","sessionId":"dx3x0uwn2","sessionDate":"2026-06-03","teamName":"Bank You, Next","playerName":"Ethan Ochoa","amount":13,"paid":false,"method":"","paidAt":null,"createdAt":"2026-06-15T16:42:59.614110Z"},{"id":"0ifl8r0ky","sessionId":"dx3x0uwn2","sessionDate":"2026-06-03","teamName":"Bank You, Next","playerName":"Marcus Reed","amount":13,"paid":true,"method":"cash","paidAt":"2026-06-15T16:42:59.614117Z","createdAt":"2026-06-15T16:42:59.614118Z"},{"id":"tebhzrd8m","sessionId":"dx3x0uwn2","sessionDate":"2026-06-03","teamName":"Bank You, Next","playerName":"Sofia Vargas","amount":13,"paid":false,"method":"","paidAt":null,"createdAt":"2026-06-15T16:42:59.614124Z"},{"id":"tt9vbjtsm","sessionId":"dx3x0uwn2","sessionDate":"2026-06-03","teamName":"Bank You, Next","playerName":"Daniel Park","amount":13,"paid":false,"method":"","paidAt":null,"createdAt":"2026-06-15T16:42:59.614131Z"},{"id":"1n5c1ejkd","sessionId":"dx3x0uwn2","sessionDate":"2026-06-03","teamName":"Bank You, Next","playerName":"Lisa Tran","amount":13,"paid":true,"method":"venmo","paidAt":"2026-06-15T16:42:59.614137Z","createdAt":"2026-06-15T16:42:59.614138Z"},{"id":"9oe2mz18x","sessionId":"mt53os7fg","sessionDate":"2026-06-15","teamName":"Bank You, Next","playerName":"Ethan Ochoa","amount":13,"paid":false,"method":"","paidAt":null,"createdAt":"2026-06-15T16:42:59.614144Z"},{"id":"enf2c8tbn","sessionId":"mt53os7fg","sessionDate":"2026-06-15","teamName":"Bank You, Next","playerName":"Sofia Vargas","amount":13,"paid":false,"method":"","paidAt":null,"createdAt":"2026-06-15T16:42:59.614150Z"}];
+const SAMPLE_FLAG_KEY = 'apa_tracker_sample_v2';
+
+// ============= helpers =============
+
+const uid = () => Math.random().toString(36).slice(2, 11);
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const fmtDate = (iso) => new Date(iso + 'T12:00:00').toLocaleDateString(undefined, { month:'short', day:'numeric', year:'numeric' });
+
+const useLocal = (key, initial) => {
+  const [v, setV] = useState(() => {
+    try { const x = localStorage.getItem(key); return x ? JSON.parse(x) : initial; } catch { return initial; }
+  });
+  useEffect(() => { try { localStorage.setItem(key, JSON.stringify(v)); } catch {} }, [key, v]);
+  return [v, setV];
+};
+
+// ============= small UI primitives =============
+
+const Section = ({ title, children, hint }) => (
+  <div className="mb-5">
+    <div className="flex items-baseline justify-between mb-3 px-1">
+      <h3 className="text-xs uppercase tracking-wider text-zinc-400 font-semibold">{title}</h3>
+      {hint && <span className="text-xs text-zinc-500">{hint}</span>}
+    </div>
+    <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-4 space-y-3">
+      {children}
+    </div>
+  </div>
+);
+
+const Field = ({ label, hint, children }) => (
+  <div>
+    <div className="flex justify-between items-baseline mb-1.5">
+      <label className="text-sm text-zinc-300">{label}</label>
+      {hint && <span className="text-xs text-zinc-500">{hint}</span>}
+    </div>
+    {children}
+  </div>
+);
+
+const TextInput = ({ value, onChange, placeholder, type='text', ...rest }) => (
+  <input
+    type={type}
+    value={value ?? ''}
+    onChange={e => onChange(e.target.value)}
+    placeholder={placeholder}
+    className="field-input w-full px-3.5 py-2.5 rounded-lg text-base"
+    {...rest}
+  />
+);
+
+const NumStepper = ({ value, onChange, min=0, max=999, step=1 }) => {
+  const set = (n) => {
+    if (n < min) n = min;
+    if (n > max) n = max;
+    onChange(n);
+  };
+  return (
+    <div className="flex items-center gap-2">
+      <button type="button" onClick={() => set((value ?? 0) - step)}
+        className="stepper-btn w-10 h-10 rounded-lg text-lg font-medium active:scale-95 transition">−</button>
+      <input
+        type="number"
+        value={value ?? ''}
+        onChange={e => {
+          const v = e.target.value === '' ? '' : Number(e.target.value);
+          if (v === '') onChange(0); else set(v);
+        }}
+        className="field-input flex-1 px-3 py-2.5 rounded-lg text-center text-base mono font-medium"
+      />
+      <button type="button" onClick={() => set((value ?? 0) + step)}
+        className="stepper-btn w-10 h-10 rounded-lg text-lg font-medium active:scale-95 transition">+</button>
+    </div>
+  );
+};
+
+const SegmentedSL = ({ value, onChange, range }) => (
+  <div className="flex gap-1.5 flex-wrap">
+    {range.map(n => (
+      <button key={n} type="button" onClick={() => onChange(n)}
+        className={`pill-toggle w-11 h-11 rounded-lg font-semibold mono text-base ${
+          value === n
+            ? 'bg-cyan-400 text-zinc-900 border border-cyan-400'
+            : 'stepper-btn'
+        }`}>{n}</button>
+    ))}
+  </div>
+);
+
+const Select = ({ value, onChange, options }) => (
+  <select value={value ?? ''} onChange={e => onChange(e.target.value)}
+    className="field-input w-full px-3 py-2.5 rounded-lg text-base">
+    <option value="">—</option>
+    {options.map(o => <option key={o} value={o}>{o}</option>)}
+  </select>
+);
+
+const Slider = ({ value, onChange, min=1, max=10 }) => (
+  <div className="flex items-center gap-3">
+    <input type="range" min={min} max={max} value={value ?? min}
+      onChange={e => onChange(Number(e.target.value))}
+      className="flex-1 accent-cyan-400" />
+    <span className="mono font-semibold text-lg w-10 text-center accent">{value ?? '—'}</span>
+  </div>
+);
+
+const ToggleYN = ({ value, onChange }) => (
+  <div className="flex gap-2">
+    {[{v:false,l:'No'},{v:true,l:'Yes'}].map(o => (
+      <button key={o.l} type="button" onClick={() => onChange(o.v)}
+        className={`pill-toggle flex-1 py-2.5 rounded-lg font-medium text-sm ${
+          value === o.v
+            ? 'bg-cyan-400 text-zinc-900 border border-cyan-400'
+            : 'stepper-btn'
+        }`}>{o.l}</button>
+    ))}
+  </div>
+);
+
+// ============= main app =============
+
+const initial8B = () => ({
+  date: todayISO(),
+  format: '8',
+  matchType: 'League',
+  teamName: '',
+  playerName: '',
+  playerSL: 4,
+  oppName: '',
+  oppSL: 4,
+  gamesWon: 0,
+  gamesOppWon: 0,
+  innings: 0,
+  yourDefShots: 0,
+  oppDefShots: 0,
+  scratchOn8: 0,
+  eightOnBreak: 0,
+  breakAndRun: 0,
+  rackless: 0,
+  missedEasy: 0,
+  missedPosition: 0,
+  poorSafety: 0,
+  mentalFocus: 5,
+  closeMatch: false,
+  whatCost: '',
+  notes: '',
+});
+
+const initial9B = () => ({
+  date: todayISO(),
+  format: '9',
+  matchType: 'League',
+  teamName: '',
+  playerName: '',
+  playerSL: 5,
+  oppName: '',
+  oppSL: 5,
+  yourBallPoints: 0,
+  oppBallPoints: 0,
+  deadBalls: 0,
+  racksStarted: 0,
+  innings: 0,
+  yourDefShots: 0,
+  oppDefShots: 0,
+  nineOnSnap: 0,
+  breakAndRun: 0,
+  closeMatch: false,
+  notes: '',
+});
+
+const App = () => {
+  const [profile, setProfile] = useLocal(PROFILE_KEY, { name: '', team: '' });
+  const [matches, setMatches] = useLocal(STORAGE_KEY, []);
+  const [format, setFormat] = useState('8');
+  const [form, setForm] = useState(initial8B());
+  const [tab, setTab] = useState('log'); // 'log' | 'history'
+  const [savedFlash, setSavedFlash] = useState(false);
+
+  // One-time seed: on first ever load, populate with imported data + sample
+  useEffect(() => {
+    try {
+      // V1 seed: original 11 matches from Ethan's spreadsheet
+      const seeded = localStorage.getItem(SEED_FLAG_KEY);
+      if (!seeded && matches.length === 0) {
+        setMatches(SEED_MATCHES);
+        if (!profile.name) setProfile(SEED_PROFILE);
+        localStorage.setItem(SEED_FLAG_KEY, '1');
+      }
+      // V2 seed: add sample sessions, payments, and extra teammate/9-Ball matches
+      const sampleSeeded = localStorage.getItem(SAMPLE_FLAG_KEY);
+      if (!sampleSeeded) {
+        setMatches(prev => {
+          const existingIds = new Set(prev.map(p => p.id));
+          const fresh = EXTRA_SEED_MATCHES.filter(m => !existingIds.has(m.id));
+          return [...fresh, ...prev];
+        });
+        // Sessions / payments are new storage keys — write directly; the useLocal hooks will read these
+        // the next time NightView / MoneyView mount.
+        if (!localStorage.getItem(SESSIONS_KEY)) {
+          localStorage.setItem(SESSIONS_KEY, JSON.stringify(SEED_SESSIONS));
+        }
+        if (!localStorage.getItem(PAYMENTS_KEY)) {
+          localStorage.setItem(PAYMENTS_KEY, JSON.stringify(SEED_PAYMENTS));
+        }
+        if (!profile.name) setProfile(SEED_PROFILE);
+        localStorage.setItem(SAMPLE_FLAG_KEY, '1');
+      }
+    } catch {}
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Switch format -> reset form (keep profile values)
+  useEffect(() => {
+    const base = format === '8' ? initial8B() : initial9B();
+    setForm({ ...base, playerName: profile.name, teamName: profile.team });
+  }, [format]);
+
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  // Auto-computed values
+  const computed = useMemo(() => {
+    if (format === '8') {
+      const raceYou = EIGHT_BALL_RACE[form.playerSL]?.[form.oppSL] ?? '—';
+      const raceOpp = EIGHT_BALL_RACE[form.oppSL]?.[form.playerSL] ?? '—';
+      const didWin = form.gamesWon >= raceYou && form.gamesWon > form.gamesOppWon;
+      const didLose = form.gamesOppWon >= raceOpp && form.gamesOppWon > form.gamesWon;
+      const result = didWin ? 'W' : (didLose ? 'L' : '—');
+      const mpFor = result === 'W' ? computeEightBallMP(form.gamesWon, raceYou, true)
+                    : result === 'L' ? computeEightBallMP(form.gamesWon, raceYou, false) : 0;
+      const mpAgainst = result === 'L' ? computeEightBallMP(form.gamesOppWon, raceOpp, true)
+                       : result === 'W' ? computeEightBallMP(form.gamesOppWon, raceOpp, false) : 0;
+      return { raceYou, raceOpp, result, mpFor, mpAgainst };
+    } else {
+      const raceYou = NINE_BALL_RACE[form.playerSL] ?? '—';
+      const raceOpp = NINE_BALL_RACE[form.oppSL] ?? '—';
+      const didWin = form.yourBallPoints >= raceYou && form.yourBallPoints > form.oppBallPoints;
+      const didLose = form.oppBallPoints >= raceOpp && form.oppBallPoints > form.yourBallPoints;
+      const result = didWin ? 'W' : (didLose ? 'L' : '—');
+      const mpFor = (result !== '—') ? computeNineBallMP(form.playerSL, form.yourBallPoints, didWin) : 0;
+      const mpAgainst = (result !== '—') ? computeNineBallMP(form.oppSL, form.oppBallPoints, didLose) : 0;
+      return { raceYou, raceOpp, result, mpFor, mpAgainst };
+    }
+  }, [form, format]);
+
+  const canSave = form.playerName && form.oppName && computed.result !== '—';
+
+  const save = () => {
+    const record = {
+      id: uid(),
+      savedAt: new Date().toISOString(),
+      ...form,
+      raceYou: computed.raceYou,
+      raceOpp: computed.raceOpp,
+      matchResult: computed.result,
+      apaPointsFor: computed.mpFor,
+      apaPointsAgainst: computed.mpAgainst,
+    };
+    setMatches([record, ...matches]);
+    // Remember profile defaults
+    setProfile({ name: form.playerName, team: form.teamName });
+    // Reset form keeping identity
+    const base = format === '8' ? initial8B() : initial9B();
+    setForm({ ...base, playerName: form.playerName, teamName: form.teamName });
+    setSavedFlash(true);
+    setTimeout(() => setSavedFlash(false), 2000);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const deleteMatch = (id) => {
+    if (!confirm('Delete this match?')) return;
+    setMatches(matches.filter(m => m.id !== id));
+  };
+
+  return (
+    <div className="min-h-screen bg-zinc-950">
+      {/* Header */}
+      <div className="sticky top-0 z-10 bg-zinc-950/95 backdrop-blur border-b border-zinc-800">
+        <div className="max-w-2xl mx-auto px-4 py-3">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h1 className="text-base font-bold tracking-tight">CueTab</h1>
+              <p className="text-xs text-zinc-500">{profile.name || 'Set your name below'}</p>
+            </div>
+            <div className="flex items-center gap-1 overflow-x-auto -mx-1 px-1" style={{scrollbarWidth: 'none'}}>
+              <button onClick={() => setTab('log')}
+                className={`text-xs px-2.5 py-1.5 rounded-lg font-medium whitespace-nowrap ${
+                  tab==='log' ? 'bg-zinc-800 text-white' : 'text-zinc-500'
+                }`}>Log</button>
+              <button onClick={() => setTab('dashboard')}
+                className={`text-xs px-2.5 py-1.5 rounded-lg font-medium whitespace-nowrap ${
+                  tab==='dashboard' ? 'bg-zinc-800 text-white' : 'text-zinc-500'
+                }`}>Dash</button>
+              <button onClick={() => setTab('history')}
+                className={`text-xs px-2.5 py-1.5 rounded-lg font-medium whitespace-nowrap ${
+                  tab==='history' ? 'bg-zinc-800 text-white' : 'text-zinc-500'
+                }`}>History</button>
+              <button onClick={() => setTab('team')}
+                className={`text-xs px-2.5 py-1.5 rounded-lg font-medium whitespace-nowrap ${
+                  tab==='team' ? 'bg-zinc-800 text-white' : 'text-zinc-500'
+                }`}>Team</button>
+              {profile.role === 'captain' && (
+                <>
+                  <button onClick={() => setTab('night')}
+                    className={`text-xs px-2.5 py-1.5 rounded-lg font-medium whitespace-nowrap ${
+                      tab==='night' ? 'bg-cyan-400 text-zinc-900' : 'text-cyan-400'
+                    }`}>Night</button>
+                  <button onClick={() => setTab('money')}
+                    className={`text-xs px-2.5 py-1.5 rounded-lg font-medium whitespace-nowrap ${
+                      tab==='money' ? 'bg-cyan-400 text-zinc-900' : 'text-cyan-400'
+                    }`}>Money</button>
+                </>
+              )}
+              <button onClick={() => setTab('settings')}
+                className={`text-xs px-2.5 py-1.5 rounded-lg font-medium whitespace-nowrap ${
+                  tab==='settings' ? 'bg-zinc-800 text-white' : 'text-zinc-500'
+                }`}>⚙</button>
+            </div>
+          </div>
+          {tab === 'log' && (
+            <div className="flex gap-2">
+              {[
+                {v:'8', label:'8-Ball'},
+                {v:'9', label:'9-Ball'},
+              ].map(o => (
+                <button key={o.v} onClick={() => setFormat(o.v)}
+                  className={`pill-toggle flex-1 py-2.5 rounded-xl font-semibold text-sm ${
+                    format === o.v
+                      ? 'bg-cyan-400 text-zinc-900'
+                      : 'bg-zinc-900 text-zinc-400 border border-zinc-800'
+                  }`}>{o.label}</button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Save flash */}
+      {savedFlash && (
+        <div className="fixed top-20 left-1/2 -translate-x-1/2 z-50 bg-cyan-400 text-zinc-900 px-4 py-2 rounded-full text-sm font-semibold glow">
+          ✓ Match saved
+        </div>
+      )}
+
+      <div className="max-w-2xl mx-auto px-4 py-4">
+        {tab === 'log' && (
+          <>
+            {/* === Match Info === */}
+            <Section title="Match info">
+              <Field label="Date">
+                <input type="date" value={form.date} onChange={e => set('date', e.target.value)}
+                  className="field-input w-full px-3 py-2.5 rounded-lg text-base" />
+              </Field>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Type">
+                  <Select value={form.matchType} onChange={v => set('matchType', v)} options={MATCH_TYPES} />
+                </Field>
+                <Field label="Team">
+                  <TextInput value={form.teamName} onChange={v => set('teamName', v)} placeholder="Bank You, Next" />
+                </Field>
+              </div>
+            </Section>
+
+            {/* === You === */}
+            <Section title="You" hint={`Race to ${computed.raceYou}`}>
+              <Field label="Your name">
+                <TextInput value={form.playerName} onChange={v => set('playerName', v)} placeholder="Your name" />
+              </Field>
+              <Field label="Your SL">
+                <SegmentedSL value={form.playerSL} onChange={v => set('playerSL', v)}
+                  range={format === '8' ? [2,3,4,5,6,7] : [1,2,3,4,5,6,7,8,9]} />
+              </Field>
+            </Section>
+
+            {/* === Opponent === */}
+            <Section title="Opponent" hint={`Race to ${computed.raceOpp}`}>
+              <Field label="Opponent name">
+                <TextInput value={form.oppName} onChange={v => set('oppName', v)} placeholder="e.g. Randy Swenson" />
+              </Field>
+              <Field label="Opponent SL">
+                <SegmentedSL value={form.oppSL} onChange={v => set('oppSL', v)}
+                  range={format === '8' ? [2,3,4,5,6,7] : [1,2,3,4,5,6,7,8,9]} />
+              </Field>
+            </Section>
+
+            {/* === Result === */}
+            <Section title="Result" hint={
+              <span className={`font-semibold ${
+                computed.result === 'W' ? 'text-green-400' :
+                computed.result === 'L' ? 'text-red-400' : 'text-zinc-500'
+              }`}>{computed.result === '—' ? 'Awaiting score' : computed.result === 'W' ? 'WIN' : 'LOSS'}</span>
+            }>
+              {format === '8' ? (
+                <>
+                  <Field label="Games you won" hint={`of ${computed.raceYou} needed`}>
+                    <NumStepper value={form.gamesWon} onChange={v => set('gamesWon', v)} max={20} />
+                  </Field>
+                  <Field label="Games opponent won" hint={`of ${computed.raceOpp} needed`}>
+                    <NumStepper value={form.gamesOppWon} onChange={v => set('gamesOppWon', v)} max={20} />
+                  </Field>
+                </>
+              ) : (
+                <>
+                  <Field label="Your ball points" hint={`of ${computed.raceYou} race`}>
+                    <NumStepper value={form.yourBallPoints} onChange={v => set('yourBallPoints', v)} max={120} />
+                  </Field>
+                  <Field label="Opponent ball points" hint={`of ${computed.raceOpp} race`}>
+                    <NumStepper value={form.oppBallPoints} onChange={v => set('oppBallPoints', v)} max={120} />
+                  </Field>
+                  <Field label="Dead balls">
+                    <NumStepper value={form.deadBalls} onChange={v => set('deadBalls', v)} max={50} />
+                  </Field>
+                  <Field label="Racks started">
+                    <NumStepper value={form.racksStarted} onChange={v => set('racksStarted', v)} max={50} />
+                  </Field>
+                </>
+              )}
+              <div className="grid grid-cols-2 gap-3 pt-1">
+                <div className="bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2.5">
+                  <div className="text-xs text-zinc-500 mb-0.5">APA Points For</div>
+                  <div className="mono text-xl font-semibold accent">{computed.mpFor}</div>
+                </div>
+                <div className="bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2.5">
+                  <div className="text-xs text-zinc-500 mb-0.5">APA Points Against</div>
+                  <div className="mono text-xl font-semibold text-zinc-400">{computed.mpAgainst}</div>
+                </div>
+              </div>
+            </Section>
+
+            {/* === Play Stats === */}
+            <Section title="Play stats">
+              <Field label="Total innings">
+                <NumStepper value={form.innings} onChange={v => set('innings', v)} max={200} />
+              </Field>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Your defensive shots">
+                  <NumStepper value={form.yourDefShots} onChange={v => set('yourDefShots', v)} max={100} />
+                </Field>
+                <Field label="Opp defensive shots">
+                  <NumStepper value={form.oppDefShots} onChange={v => set('oppDefShots', v)} max={100} />
+                </Field>
+              </div>
+            </Section>
+
+            {/* === Format-specific events === */}
+            {format === '8' ? (
+              <Section title="8-Ball events">
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Scratch on 8"><NumStepper value={form.scratchOn8} onChange={v => set('scratchOn8', v)} max={20} /></Field>
+                  <Field label="8 on break"><NumStepper value={form.eightOnBreak} onChange={v => set('eightOnBreak', v)} max={20} /></Field>
+                  <Field label="Break-and-run"><NumStepper value={form.breakAndRun} onChange={v => set('breakAndRun', v)} max={20} /></Field>
+                  <Field label="Rackless"><NumStepper value={form.rackless} onChange={v => set('rackless', v)} max={20} /></Field>
+                </div>
+              </Section>
+            ) : (
+              <Section title="9-Ball events">
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="9-on-snap"><NumStepper value={form.nineOnSnap} onChange={v => set('nineOnSnap', v)} max={20} /></Field>
+                  <Field label="Break-and-run"><NumStepper value={form.breakAndRun} onChange={v => set('breakAndRun', v)} max={20} /></Field>
+                </div>
+              </Section>
+            )}
+
+            {/* === Mistake tracking (8-ball only) === */}
+            {format === '8' && (
+              <Section title="Mistakes (optional)" hint="leave 0 to skip">
+                <div className="grid grid-cols-3 gap-2">
+                  <Field label="Easy"><NumStepper value={form.missedEasy} onChange={v => set('missedEasy', v)} max={30} /></Field>
+                  <Field label="Position"><NumStepper value={form.missedPosition} onChange={v => set('missedPosition', v)} max={30} /></Field>
+                  <Field label="Safety"><NumStepper value={form.poorSafety} onChange={v => set('poorSafety', v)} max={30} /></Field>
+                </div>
+              </Section>
+            )}
+
+            {/* === Mental + notes === */}
+            <Section title="Mental & context">
+              {format === '8' && (
+                <Field label="Mental focus" hint="1 (off) → 10 (locked in)">
+                  <Slider value={form.mentalFocus} onChange={v => set('mentalFocus', v)} min={1} max={10} />
+                </Field>
+              )}
+              <Field label="Close match?">
+                <ToggleYN value={form.closeMatch} onChange={v => set('closeMatch', v)} />
+              </Field>
+              {format === '8' && (
+                <Field label="What cost racks?">
+                  <textarea value={form.whatCost} onChange={e => set('whatCost', e.target.value)}
+                    placeholder="What kept hurting you tonight?"
+                    rows="2"
+                    className="field-input w-full px-3 py-2.5 rounded-lg text-sm resize-none" />
+                </Field>
+              )}
+              <Field label="General notes">
+                <textarea value={form.notes} onChange={e => set('notes', e.target.value)}
+                  placeholder="How did the match feel?"
+                  rows="3"
+                  className="field-input w-full px-3 py-2.5 rounded-lg text-sm resize-none" />
+              </Field>
+            </Section>
+
+            {/* === Save === */}
+            <div className="pt-2 pb-8">
+              <button onClick={save} disabled={!canSave}
+                className={`w-full py-4 rounded-2xl font-semibold text-base transition ${
+                  canSave
+                    ? 'bg-cyan-400 text-zinc-900 active:scale-[0.98] glow'
+                    : 'bg-zinc-800 text-zinc-500 cursor-not-allowed'
+                }`}>
+                {canSave ? `Save ${computed.result === 'W' ? 'win' : 'loss'}` : 'Fill name + score to save'}
+              </button>
+              {!canSave && (
+                <p className="text-center text-xs text-zinc-500 mt-2">
+                  {!form.playerName ? 'Enter your name' :
+                   !form.oppName ? 'Enter opponent name' :
+                   'Score doesn\'t reach race target yet'}
+                </p>
+              )}
+            </div>
+          </>
+        )}
+
+        {tab === 'dashboard' && <Dashboard matches={matches} profile={profile} />}
+        {tab === 'history' && <History matches={matches} onDelete={deleteMatch} setMatches={setMatches} />}
+        {tab === 'team' && <TeamView matches={matches} />}
+        {tab === 'night' && profile.role === 'captain' && <NightView profile={profile} matches={matches} setMatches={setMatches} />}
+        {tab === 'money' && profile.role === 'captain' && <MoneyView profile={profile} />}
+        {tab === 'settings' && <SettingsView profile={profile} setProfile={setProfile} />}
+      </div>
+    </div>
+  );
+};
+
+// ============= History view =============
+
+const History = ({ matches, onDelete, setMatches }) => {
+  const [filter, setFilter] = useState('all'); // 'all' | '8' | '9'
+  const [showImport, setShowImport] = useState(false);
+  const filtered = matches.filter(m => filter === 'all' || m.format === filter);
+
+  const stats = useMemo(() => {
+    const wins = filtered.filter(m => m.matchResult === 'W').length;
+    const losses = filtered.filter(m => m.matchResult === 'L').length;
+    const total = wins + losses;
+    const winPct = total ? Math.round((wins / total) * 100) : 0;
+    const ptsFor = filtered.reduce((s, m) => s + (m.apaPointsFor || 0), 0);
+    const ptsAgainst = filtered.reduce((s, m) => s + (m.apaPointsAgainst || 0), 0);
+    return { wins, losses, total, winPct, ptsFor, ptsAgainst };
+  }, [filtered]);
+
+  if (matches.length === 0) {
+    return (
+      <div>
+        <div className="text-center py-12">
+          <div className="text-5xl mb-3 opacity-30">🎱</div>
+          <p className="text-zinc-400 mb-1">No matches yet</p>
+          <p className="text-zinc-600 text-sm mb-5">Log your first match or import from Excel</p>
+          <button onClick={() => setShowImport(!showImport)}
+            className="bg-cyan-400 text-zinc-900 px-5 py-2.5 rounded-xl font-semibold text-sm">
+            {showImport ? 'Cancel' : 'Import from Excel'}
+          </button>
+        </div>
+        {showImport && <ImportXlsx setMatches={setMatches} matches={matches} onDone={() => setShowImport(false)} />}
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex gap-2 flex-1">
+          {[{v:'all',l:'All'},{v:'8',l:'8B'},{v:'9',l:'9B'}].map(o => (
+            <button key={o.v} onClick={() => setFilter(o.v)}
+              className={`pill-toggle px-3 py-1.5 rounded-lg font-medium text-sm ${
+                filter === o.v ? 'bg-cyan-400 text-zinc-900' : 'bg-zinc-900 border border-zinc-800 text-zinc-400'
+              }`}>{o.l}</button>
+          ))}
+        </div>
+        <button onClick={() => setShowImport(!showImport)} className="text-xs text-cyan-400 font-medium ml-2">
+          {showImport ? 'Cancel' : 'Import'}
+        </button>
+      </div>
+      {showImport && <ImportXlsx setMatches={setMatches} matches={matches} onDone={() => setShowImport(false)} />}
+
+      <div className="grid grid-cols-3 gap-2 mb-5">
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3 text-center">
+          <div className="text-xs text-zinc-500 mb-1">Record</div>
+          <div className="mono text-lg font-semibold">{stats.wins}<span className="text-zinc-500 mx-1">·</span>{stats.losses}</div>
+        </div>
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3 text-center">
+          <div className="text-xs text-zinc-500 mb-1">Win %</div>
+          <div className="mono text-lg font-semibold accent">{stats.winPct}%</div>
+        </div>
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3 text-center">
+          <div className="text-xs text-zinc-500 mb-1">Pt diff</div>
+          <div className={`mono text-lg font-semibold ${stats.ptsFor - stats.ptsAgainst >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+            {stats.ptsFor - stats.ptsAgainst >= 0 ? '+' : ''}{stats.ptsFor - stats.ptsAgainst}
+          </div>
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        {filtered.map(m => (
+          <div key={m.id} className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3.5">
+            <div className="flex items-center justify-between mb-1.5">
+              <div className="flex items-center gap-2">
+                <span className={`mono text-xs font-bold px-2 py-0.5 rounded ${
+                  m.matchResult === 'W' ? 'bg-green-400/20 text-green-400' : 'bg-red-400/20 text-red-400'
+                }`}>{m.matchResult}</span>
+                <span className="text-xs text-zinc-500 mono">{m.format}B</span>
+                <span className="text-xs text-zinc-600">·</span>
+                <span className="text-xs text-zinc-500">{fmtDate(m.date)}</span>
+              </div>
+              <button onClick={() => onDelete(m.id)} className="text-xs text-zinc-600 hover:text-red-400 transition">Delete</button>
+            </div>
+            <div className="flex items-baseline justify-between">
+              <div>
+                <div className="text-sm font-medium">vs {m.oppName} <span className="text-zinc-500 text-xs mono">SL{m.oppSL}</span></div>
+                {m.teamName && <div className="text-xs text-zinc-500">{m.teamName}</div>}
+              </div>
+              <div className="text-right">
+                <div className="mono text-sm">
+                  <span className={m.matchResult === 'W' ? 'accent font-semibold' : ''}>
+                    {m.format === '8' ? m.gamesWon : m.yourBallPoints}
+                  </span>
+                  <span className="text-zinc-600 mx-1">—</span>
+                  <span className={m.matchResult === 'L' ? 'text-red-400 font-semibold' : ''}>
+                    {m.format === '8' ? m.gamesOppWon : m.oppBallPoints}
+                  </span>
+                </div>
+                <div className="text-xs text-zinc-500 mono">{m.apaPointsFor} / {m.apaPointsAgainst} APA</div>
+              </div>
+            </div>
+            {(m.closeMatch || m.notes) && (
+              <div className="mt-2 pt-2 border-t border-zinc-800 flex items-center gap-2 text-xs">
+                {m.closeMatch && <span className="bg-amber-400/10 text-amber-400 px-1.5 py-0.5 rounded mono">CLOSE</span>}
+                {m.notes && <span className="text-zinc-500 truncate flex-1">{m.notes}</span>}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </>
+  );
+};
+
+// ============= Team view (captain) =============
+
+const APA_8B_TEAM_LIMIT = 23;
+const ROSTER_KEY = 'apa_tracker_roster_v1';
+const LINEUPS_KEY = 'apa_tracker_lineups_v1';
+
+// Derive team list from matches + manually added roster entries
+const deriveTeamNames = (matches, roster) => {
+  const s = new Set();
+  matches.forEach(m => m.teamName && s.add(m.teamName));
+  Object.keys(roster || {}).forEach(t => s.add(t));
+  return Array.from(s);
+};
+
+// Derive players who have logged matches for a team, merged with manually added roster
+const deriveRoster = (matches, rosterStore, teamName) => {
+  const map = new Map();
+  // From matches: each playerName that played for this team
+  matches.filter(m => m.teamName === teamName).forEach(m => {
+    if (!m.playerName) return;
+    const key = m.playerName;
+    if (!map.has(key)) map.set(key, { name: m.playerName, sl8: null, sl9: null, fromMatches: true });
+    const p = map.get(key);
+    if (m.format === '8' && m.playerSL) p.sl8 = m.playerSL;
+    if (m.format === '9' && m.playerSL) p.sl9 = m.playerSL;
+  });
+  // Manually added players
+  (rosterStore[teamName] || []).forEach(p => {
+    if (!map.has(p.name)) map.set(p.name, { name: p.name, sl8: p.sl8, sl9: p.sl9, fromMatches: false });
+    else {
+      const e = map.get(p.name);
+      e.sl8 = e.sl8 ?? p.sl8;
+      e.sl9 = e.sl9 ?? p.sl9;
+    }
+  });
+  return Array.from(map.values());
+};
+
+// Per-player stats for a team
+const playerStats = (matches, playerName, teamName, fmt) => {
+  const ms = matches.filter(m =>
+    m.playerName === playerName && m.teamName === teamName && (fmt === 'all' || m.format === fmt)
+  );
+  const wins = ms.filter(m => m.matchResult === 'W').length;
+  const losses = ms.filter(m => m.matchResult === 'L').length;
+  const total = wins + losses;
+  const winPct = total ? Math.round((wins / total) * 100) : null;
+  const last5 = ms
+    .slice()
+    .sort((a, b) => (b.date || '').localeCompare(a.date || ''))
+    .slice(0, 5)
+    .map(m => m.matchResult);
+  const close = ms.filter(m => m.closeMatch);
+  const closeWins = close.filter(m => m.matchResult === 'W').length;
+  const closePct = close.length ? Math.round((closeWins / close.length) * 100) : null;
+  const ptsFor = ms.reduce((s, m) => s + (m.apaPointsFor || 0), 0);
+  const ptsAgainst = ms.reduce((s, m) => s + (m.apaPointsAgainst || 0), 0);
+  return { wins, losses, total, winPct, last5, closeMatches: close.length, closePct, ptsFor, ptsAgainst };
+};
+
+// Per-player win % vs a given opponent SL
+const winPctVsSL = (matches, playerName, teamName, fmt, oppSL) => {
+  const ms = matches.filter(m =>
+    m.playerName === playerName && m.teamName === teamName && m.format === fmt && m.oppSL === oppSL
+  );
+  if (ms.length === 0) return null;
+  const wins = ms.filter(m => m.matchResult === 'W').length;
+  return { pct: Math.round((wins / ms.length) * 100), n: ms.length };
+};
+
+const TeamView = ({ matches }) => {
+  const [rosterStore, setRosterStore] = useLocal(ROSTER_KEY, {});
+  const [lineups, setLineups] = useLocal(LINEUPS_KEY, []);
+
+  const allTeams = useMemo(() => deriveTeamNames(matches, rosterStore), [matches, rosterStore]);
+  const [activeTeam, setActiveTeam] = useState(allTeams[0] || '');
+  const [subTab, setSubTab] = useState('roster'); // 'roster' | 'lineup'
+  const [format, setFormat] = useState('8');
+
+  // Keep activeTeam valid when allTeams changes
+  useEffect(() => {
+    if (allTeams.length === 0) { setActiveTeam(''); return; }
+    if (!allTeams.includes(activeTeam)) setActiveTeam(allTeams[0]);
+  }, [allTeams.join('|')]);
+
+  const roster = useMemo(
+    () => activeTeam ? deriveRoster(matches, rosterStore, activeTeam) : [],
+    [matches, rosterStore, activeTeam]
+  );
+
+  const [showAdd, setShowAdd] = useState(false);
+  const [addName, setAddName] = useState('');
+  const [addSL8, setAddSL8] = useState(4);
+  const [addSL9, setAddSL9] = useState(5);
+  const [addTeamMode, setAddTeamMode] = useState(false);
+  const [newTeamName, setNewTeamName] = useState('');
+
+  const addPlayer = () => {
+    if (!addName.trim() || !activeTeam) return;
+    const list = rosterStore[activeTeam] || [];
+    if (list.find(p => p.name === addName.trim())) { alert('Player already on roster'); return; }
+    setRosterStore({
+      ...rosterStore,
+      [activeTeam]: [...list, { id: uid(), name: addName.trim(), sl8: addSL8, sl9: addSL9 }],
+    });
+    setAddName(''); setShowAdd(false);
+  };
+
+  const addTeam = () => {
+    if (!newTeamName.trim()) return;
+    setRosterStore({ ...rosterStore, [newTeamName.trim()]: rosterStore[newTeamName.trim()] || [] });
+    setActiveTeam(newTeamName.trim());
+    setNewTeamName(''); setAddTeamMode(false);
+  };
+
+  if (allTeams.length === 0) {
+    return (
+      <div className="text-center py-16">
+        <p className="text-zinc-400 mb-3">No teams yet</p>
+        <p className="text-zinc-600 text-sm mb-5">Log a match with a team name, or add one manually.</p>
+        {!addTeamMode ? (
+          <button onClick={() => setAddTeamMode(true)}
+            className="bg-cyan-400 text-zinc-900 px-5 py-2.5 rounded-xl font-semibold">+ Add team</button>
+        ) : (
+          <div className="max-w-xs mx-auto flex gap-2">
+            <input value={newTeamName} onChange={e => setNewTeamName(e.target.value)}
+              placeholder="Team name" autoFocus
+              className="field-input flex-1 px-3 py-2.5 rounded-lg" />
+            <button onClick={addTeam} className="bg-cyan-400 text-zinc-900 px-4 rounded-lg font-semibold">Add</button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {/* Team selector */}
+      <div className="mb-4">
+        <div className="flex items-center gap-2 mb-3">
+          {allTeams.length === 1 ? (
+            <div className="flex-1 px-3 py-2.5 bg-zinc-900 border border-zinc-800 rounded-lg text-sm font-medium">{activeTeam}</div>
+          ) : (
+            <select value={activeTeam} onChange={e => setActiveTeam(e.target.value)}
+              className="field-input flex-1 px-3 py-2.5 rounded-lg text-base font-medium">
+              {allTeams.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+          )}
+          <button onClick={() => setAddTeamMode(!addTeamMode)}
+            className="stepper-btn px-3 py-2.5 rounded-lg text-sm" title="Add team">+ Team</button>
+        </div>
+        {addTeamMode && (
+          <div className="flex gap-2 mb-3">
+            <input value={newTeamName} onChange={e => setNewTeamName(e.target.value)}
+              placeholder="New team name" autoFocus
+              className="field-input flex-1 px-3 py-2 rounded-lg text-sm" />
+            <button onClick={addTeam} className="bg-cyan-400 text-zinc-900 px-3 rounded-lg text-sm font-semibold">Add</button>
+            <button onClick={() => { setAddTeamMode(false); setNewTeamName(''); }}
+              className="stepper-btn px-3 rounded-lg text-sm">Cancel</button>
+          </div>
+        )}
+        {/* Sub-tabs */}
+        <div className="flex gap-2">
+          <button onClick={() => setSubTab('roster')}
+            className={`pill-toggle flex-1 py-2 rounded-lg font-medium text-xs ${
+              subTab === 'roster' ? 'bg-cyan-400 text-zinc-900' : 'bg-zinc-900 border border-zinc-800 text-zinc-400'
+            }`}>Roster <span className="opacity-60">({roster.length})</span></button>
+          <button onClick={() => setSubTab('lineup')}
+            className={`pill-toggle flex-1 py-2 rounded-lg font-medium text-xs ${
+              subTab === 'lineup' ? 'bg-cyan-400 text-zinc-900' : 'bg-zinc-900 border border-zinc-800 text-zinc-400'
+            }`}>Lineup</button>
+          <button onClick={() => setSubTab('vs')}
+            className={`pill-toggle flex-1 py-2 rounded-lg font-medium text-xs ${
+              subTab === 'vs' ? 'bg-cyan-400 text-zinc-900' : 'bg-zinc-900 border border-zinc-800 text-zinc-400'
+            }`}>vs Opp</button>
+        </div>
+      </div>
+
+      {subTab === 'roster' && (
+        <Roster
+          roster={roster}
+          matches={matches}
+          teamName={activeTeam}
+          onAdd={() => setShowAdd(!showAdd)}
+          showAdd={showAdd}
+          addName={addName} setAddName={setAddName}
+          addSL8={addSL8} setAddSL8={setAddSL8}
+          addSL9={addSL9} setAddSL9={setAddSL9}
+          submitAdd={addPlayer}
+        />
+      )}
+
+      {subTab === 'lineup' && (
+        <LineupBuilder
+          roster={roster}
+          matches={matches}
+          teamName={activeTeam}
+          lineups={lineups}
+          setLineups={setLineups}
+          format={format}
+          setFormat={setFormat}
+        />
+      )}
+
+      {subTab === 'vs' && (
+        <VsOpponent
+          roster={roster}
+          matches={matches}
+          teamName={activeTeam}
+          format={format}
+          setFormat={setFormat}
+        />
+      )}
+    </>
+  );
+};
+
+// ============= Roster =============
+
+const Roster = ({ roster, matches, teamName, onAdd, showAdd, addName, setAddName, addSL8, setAddSL8, addSL9, setAddSL9, submitAdd }) => {
+  const [expanded, setExpanded] = useState(null);
+
+  return (
+    <>
+      <div className="flex items-center justify-between mb-3">
+        <p className="text-xs uppercase tracking-wider text-zinc-400 font-semibold">Players</p>
+        <button onClick={onAdd} className="text-xs text-cyan-400 font-medium">
+          {showAdd ? 'Cancel' : '+ Add player'}
+        </button>
+      </div>
+
+      {showAdd && (
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-4 mb-3 space-y-3">
+          <Field label="Player name">
+            <TextInput value={addName} onChange={setAddName} placeholder="Full name" />
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="8-Ball SL">
+              <NumStepper value={addSL8} onChange={setAddSL8} min={2} max={7} />
+            </Field>
+            <Field label="9-Ball SL">
+              <NumStepper value={addSL9} onChange={setAddSL9} min={1} max={9} />
+            </Field>
+          </div>
+          <button onClick={submitAdd} disabled={!addName.trim()}
+            className={`w-full py-2.5 rounded-lg font-semibold text-sm ${
+              addName.trim() ? 'bg-cyan-400 text-zinc-900' : 'bg-zinc-800 text-zinc-500'
+            }`}>Add to roster</button>
+        </div>
+      )}
+
+      {roster.length === 0 ? (
+        <div className="text-center py-12">
+          <p className="text-zinc-500 text-sm">No players yet. Add one above, or log a match for this team.</p>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {roster.map(p => {
+            const s8 = playerStats(matches, p.name, teamName, '8');
+            const s9 = playerStats(matches, p.name, teamName, '9');
+            const isOpen = expanded === p.name;
+            return (
+              <div key={p.name} className="bg-zinc-900/50 border border-zinc-800 rounded-xl overflow-hidden">
+                <button onClick={() => setExpanded(isOpen ? null : p.name)}
+                  className="w-full p-3.5 text-left active:bg-zinc-900 transition">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-semibold">{p.name}</span>
+                      {!p.fromMatches && <span className="text-[10px] text-zinc-500 bg-zinc-800 px-1.5 py-0.5 rounded">manual</span>}
+                    </div>
+                    <span className="text-xs text-zinc-500">{isOpen ? '−' : '+'}</span>
+                  </div>
+                  <div className="flex items-center gap-4 text-xs text-zinc-400">
+                    {p.sl8 != null && <span>8B <span className="mono accent">SL{p.sl8}</span></span>}
+                    {p.sl9 != null && <span>9B <span className="mono accent">SL{p.sl9}</span></span>}
+                    <span className="ml-auto mono">
+                      {s8.total + s9.total > 0
+                        ? `${s8.wins + s9.wins}W · ${s8.losses + s9.losses}L`
+                        : <span className="text-zinc-600">no matches</span>}
+                    </span>
+                  </div>
+                  {(s8.last5.length > 0 || s9.last5.length > 0) && (
+                    <div className="flex items-center gap-1 mt-2">
+                      <span className="text-[10px] text-zinc-500 mr-1">Last 5:</span>
+                      {[...s8.last5, ...s9.last5].slice(0, 5).map((r, i) => (
+                        <span key={i} className={`w-5 h-5 rounded text-[10px] font-bold mono flex items-center justify-center ${
+                          r === 'W' ? 'bg-green-400/20 text-green-400' : 'bg-red-400/20 text-red-400'
+                        }`}>{r}</span>
+                      ))}
+                    </div>
+                  )}
+                </button>
+
+                {isOpen && (s8.total > 0 || s9.total > 0) && (
+                  <div className="border-t border-zinc-800 p-3.5 bg-zinc-950/50 space-y-3">
+                    {['8', '9'].map(fmt => {
+                      const s = fmt === '8' ? s8 : s9;
+                      if (s.total === 0) return null;
+                      return (
+                        <div key={fmt}>
+                          <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-1.5 font-semibold">{fmt}-Ball</div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <div className="bg-zinc-900 rounded-lg px-2 py-1.5 text-center">
+                              <div className="text-[10px] text-zinc-500">Win %</div>
+                              <div className="mono text-sm font-semibold accent">{s.winPct ?? '—'}%</div>
+                            </div>
+                            <div className="bg-zinc-900 rounded-lg px-2 py-1.5 text-center">
+                              <div className="text-[10px] text-zinc-500">Close</div>
+                              <div className="mono text-sm font-semibold">{s.closeMatches > 0 ? `${s.closePct}%` : '—'}</div>
+                            </div>
+                            <div className="bg-zinc-900 rounded-lg px-2 py-1.5 text-center">
+                              <div className="text-[10px] text-zinc-500">Pt diff</div>
+                              <div className={`mono text-sm font-semibold ${s.ptsFor - s.ptsAgainst >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                {s.ptsFor - s.ptsAgainst >= 0 ? '+' : ''}{s.ptsFor - s.ptsAgainst}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </>
+  );
+};
+
+// ============= Lineup Builder =============
+
+const LineupBuilder = ({ roster, matches, teamName, lineups, setLineups, format, setFormat }) => {
+  // 5 slots, each: { playerName, oppSL }
+  const [slots, setSlots] = useState(() => Array(5).fill(null).map(() => ({ playerName: '', oppSL: null })));
+  const [showPicker, setShowPicker] = useState(null); // slot index or null
+  const [oppTeam, setOppTeam] = useState('');
+
+  const filledSlots = slots.filter(s => s.playerName);
+  const slKey = format === '8' ? 'sl8' : 'sl9';
+  const slTotal = filledSlots.reduce((sum, s) => {
+    const p = roster.find(r => r.name === s.playerName);
+    return sum + (p?.[slKey] || 0);
+  }, 0);
+  const overLimit = format === '8' && slTotal > APA_8B_TEAM_LIMIT;
+  const remaining = APA_8B_TEAM_LIMIT - slTotal;
+
+  const pickPlayer = (idx, name) => {
+    setSlots(slots.map((s, i) => i === idx ? { ...s, playerName: name } : s));
+    setShowPicker(null);
+  };
+
+  const setOppSL = (idx, sl) => {
+    setSlots(slots.map((s, i) => i === idx ? { ...s, oppSL: sl } : s));
+  };
+
+  const clearSlot = (idx) => {
+    setSlots(slots.map((s, i) => i === idx ? { playerName: '', oppSL: null } : s));
+  };
+
+  const saveLineup = () => {
+    if (filledSlots.length === 0) return;
+    setLineups([{
+      id: uid(),
+      savedAt: new Date().toISOString(),
+      teamName, oppTeam, format,
+      slots: slots.filter(s => s.playerName),
+      slTotal,
+    }, ...lineups]);
+    setSlots(Array(5).fill(null).map(() => ({ playerName: '', oppSL: null })));
+    setOppTeam('');
+    alert('Lineup saved');
+  };
+
+  return (
+    <>
+      {/* Format toggle */}
+      <div className="flex gap-2 mb-4">
+        {['8', '9'].map(v => (
+          <button key={v} onClick={() => setFormat(v)}
+            className={`pill-toggle flex-1 py-2 rounded-lg font-medium text-sm ${
+              format === v ? 'bg-cyan-400 text-zinc-900' : 'bg-zinc-900 border border-zinc-800 text-zinc-400'
+            }`}>{v}-Ball</button>
+        ))}
+      </div>
+
+      {/* Opp team */}
+      <div className="mb-4">
+        <Field label="Opposing team (optional)">
+          <TextInput value={oppTeam} onChange={setOppTeam} placeholder="e.g. Cue Tip Crew" />
+        </Field>
+      </div>
+
+      {/* SL total bar (8-Ball only) */}
+      {format === '8' && (
+        <div className={`mb-4 p-3 rounded-xl border ${
+          overLimit ? 'bg-red-400/10 border-red-400/40' :
+          slTotal === APA_8B_TEAM_LIMIT ? 'bg-amber-400/10 border-amber-400/40' :
+          'bg-zinc-900 border-zinc-800'
+        }`}>
+          <div className="flex items-baseline justify-between mb-1.5">
+            <span className="text-xs uppercase tracking-wider text-zinc-400 font-semibold">23-Rule total</span>
+            <span className={`mono text-xl font-bold ${
+              overLimit ? 'text-red-400' : slTotal === APA_8B_TEAM_LIMIT ? 'text-amber-400' : 'accent'
+            }`}>{slTotal} / 23</span>
+          </div>
+          <div className="h-2 bg-zinc-950 rounded-full overflow-hidden">
+            <div className={`h-full transition-all ${
+              overLimit ? 'bg-red-400' : slTotal === APA_8B_TEAM_LIMIT ? 'bg-amber-400' : 'bg-cyan-400'
+            }`} style={{ width: `${Math.min(100, (slTotal / 23) * 100)}%` }} />
+          </div>
+          <p className="text-xs text-zinc-500 mt-1.5">
+            {overLimit ? `Over by ${slTotal - 23} — drop a higher SL player` :
+             remaining === 0 ? 'Exactly 23 — locked in' :
+             `${remaining} room left`}
+          </p>
+        </div>
+      )}
+
+      {/* Slots */}
+      <div className="space-y-2 mb-4">
+        {slots.map((slot, idx) => {
+          const player = slot.playerName ? roster.find(r => r.name === slot.playerName) : null;
+          const sl = player?.[slKey];
+          const winInfo = (player && slot.oppSL) ? winPctVsSL(matches, player.name, teamName, format, slot.oppSL) : null;
+          return (
+            <div key={idx} className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="w-6 h-6 rounded-full bg-zinc-800 text-xs mono font-semibold flex items-center justify-center text-zinc-400">{idx+1}</span>
+                {player ? (
+                  <>
+                    <span className="flex-1 text-sm font-medium">{player.name}</span>
+                    <span className="text-xs mono accent">SL{sl ?? '?'}</span>
+                    <button onClick={() => clearSlot(idx)} className="text-xs text-zinc-500 hover:text-red-400">✕</button>
+                  </>
+                ) : (
+                  <button onClick={() => setShowPicker(showPicker === idx ? null : idx)}
+                    className="flex-1 text-left text-sm text-zinc-500 italic">+ Choose player…</button>
+                )}
+              </div>
+              {showPicker === idx && (
+                <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-2 mb-2 max-h-48 overflow-y-auto">
+                  {roster.filter(r => !slots.find(s => s.playerName === r.name)).length === 0 ? (
+                    <p className="text-xs text-zinc-500 p-2 text-center">All roster players already added</p>
+                  ) : (
+                    roster.filter(r => !slots.find(s => s.playerName === r.name)).map(r => (
+                      <button key={r.name} onClick={() => pickPlayer(idx, r.name)}
+                        className="w-full text-left px-2 py-2 rounded hover:bg-zinc-900 flex items-center justify-between text-sm">
+                        <span>{r.name}</span>
+                        <span className="text-xs mono text-zinc-500">SL{r[slKey] ?? '?'}</span>
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
+              {player && (
+                <div className="flex items-center gap-2 pt-2 border-t border-zinc-800/60">
+                  <span className="text-xs text-zinc-500">vs SL</span>
+                  <div className="flex gap-1 flex-wrap flex-1">
+                    {(format === '8' ? [2,3,4,5,6,7] : [1,2,3,4,5,6,7,8,9]).map(n => (
+                      <button key={n} onClick={() => setOppSL(idx, slot.oppSL === n ? null : n)}
+                        className={`w-7 h-7 rounded text-xs mono font-semibold ${
+                          slot.oppSL === n ? 'bg-cyan-400 text-zinc-900' : 'bg-zinc-800 text-zinc-400'
+                        }`}>{n}</button>
+                    ))}
+                  </div>
+                  {winInfo && (
+                    <span className={`text-xs mono font-semibold ${
+                      winInfo.pct >= 50 ? 'text-green-400' : winInfo.pct >= 25 ? 'text-amber-400' : 'text-red-400'
+                    }`}>{winInfo.pct}% <span className="text-zinc-500">({winInfo.n})</span></span>
+                  )}
+                  {slot.oppSL && !winInfo && (
+                    <span className="text-xs text-zinc-500">no history</span>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <button onClick={saveLineup} disabled={filledSlots.length === 0 || overLimit}
+        className={`w-full py-3 rounded-2xl font-semibold text-sm mb-6 ${
+          filledSlots.length > 0 && !overLimit
+            ? 'bg-cyan-400 text-zinc-900 glow'
+            : 'bg-zinc-800 text-zinc-500'
+        }`}>
+        {overLimit ? 'Over 23-rule limit' : filledSlots.length === 0 ? 'Add a player' : `Save lineup (${filledSlots.length}/5)`}
+      </button>
+
+      {/* Saved lineups */}
+      {lineups.filter(l => l.teamName === teamName).length > 0 && (
+        <>
+          <p className="text-xs uppercase tracking-wider text-zinc-400 font-semibold mb-2">Saved lineups</p>
+          <div className="space-y-2">
+            {lineups.filter(l => l.teamName === teamName).slice(0, 5).map(l => (
+              <div key={l.id} className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3">
+                <div className="flex items-baseline justify-between mb-1.5">
+                  <span className="text-xs mono text-zinc-400">{l.format}B {l.oppTeam ? `vs ${l.oppTeam}` : ''}</span>
+                  <span className="text-xs mono accent">SL {l.slTotal}</span>
+                </div>
+                <div className="text-xs text-zinc-300 leading-relaxed">
+                  {l.slots.map(s => s.playerName).join(' · ')}
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </>
+  );
+};
+
+// ============= Dashboard =============
+
+const generateCoachTags = (matches, format) => {
+  const tags = [];
+  if (matches.length === 0) return tags;
+  const wins = matches.filter(m => m.matchResult === 'W').length;
+  const losses = matches.filter(m => m.matchResult === 'L').length;
+  const total = wins + losses;
+  const winPct = total ? wins / total : 0;
+
+  if (total >= 3 && winPct < 0.35) tags.push({ kind: 'risk', label: 'Performance', text: 'Low win rate' });
+  else if (total >= 3 && winPct >= 0.60) tags.push({ kind: 'strength', label: 'Performance', text: 'Strong win rate' });
+
+  const close = matches.filter(m => m.closeMatch);
+  if (close.length >= 2) {
+    const closeWins = close.filter(m => m.matchResult === 'W').length;
+    const pct = closeWins / close.length;
+    if (pct < 0.3) tags.push({ kind: 'risk', label: 'Close matches', text: 'Struggling under pressure' });
+    else if (pct >= 0.6) tags.push({ kind: 'strength', label: 'Close matches', text: 'Clutch in close matches' });
+  }
+
+  if (format === '8') {
+    const scratchTotal = matches.reduce((s, m) => s + (m.scratchOn8 || 0), 0);
+    if (scratchTotal >= 2) tags.push({ kind: 'risk', label: 'Risk', text: `Scratch on 8 ${scratchTotal}x — major risk` });
+    const inningMatches = matches.filter(m => m.innings > 0);
+    if (inningMatches.length >= 3) {
+      const avgInn = inningMatches.reduce((s, m) => s + m.innings, 0) / inningMatches.length;
+      if (avgInn < 18) tags.push({ kind: 'strength', label: 'Efficiency', text: `Avg ${avgInn.toFixed(1)} innings/match — efficient` });
+      else if (avgInn > 25) tags.push({ kind: 'info', label: 'Efficiency', text: `Avg ${avgInn.toFixed(1)} innings — long games` });
+    }
+  } else {
+    const snapTotal = matches.reduce((s, m) => s + (m.nineOnSnap || 0), 0);
+    if (snapTotal >= 1) tags.push({ kind: 'strength', label: 'Break', text: `9-on-snap ${snapTotal}x` });
+    const brTotal = matches.reduce((s, m) => s + (m.breakAndRun || 0), 0);
+    if (brTotal >= 1) tags.push({ kind: 'strength', label: 'Break', text: `Break-and-run ${brTotal}x` });
+  }
+
+  const defShotsMatches = matches.filter(m => m.yourDefShots != null && m.innings > 0);
+  if (defShotsMatches.length >= 3) {
+    const avgDef = defShotsMatches.reduce((s, m) => s + m.yourDefShots, 0) / defShotsMatches.length;
+    if (avgDef >= 4) tags.push({ kind: 'info', label: 'Defense', text: `${avgDef.toFixed(1)} safeties/match — defensive` });
+    else if (avgDef < 1) tags.push({ kind: 'info', label: 'Defense', text: 'Rarely plays safeties' });
+  }
+
+  return tags;
+};
+
+const Dashboard = ({ matches, profile }) => {
+  const [format, setFormat] = useState('8');
+  const playerName = profile.name;
+
+  const playerMatches = useMemo(
+    () => matches.filter(m => m.format === format && (!playerName || m.playerName === playerName)),
+    [matches, format, playerName]
+  );
+
+  if (playerMatches.length === 0) {
+    return (
+      <div className="text-center py-16">
+        <div className="text-4xl mb-3 opacity-30">📊</div>
+        <p className="text-zinc-400 mb-1">No {format}-Ball matches yet</p>
+        <p className="text-zinc-600 text-sm">
+          {playerName ? `for ${playerName}` : 'Log a match in the Log tab to populate this dashboard'}
+        </p>
+        <div className="flex gap-2 max-w-xs mx-auto mt-6">
+          {['8','9'].map(v => (
+            <button key={v} onClick={() => setFormat(v)}
+              className={`pill-toggle flex-1 py-2 rounded-lg font-medium text-sm ${
+                format === v ? 'bg-cyan-400 text-zinc-900' : 'bg-zinc-900 border border-zinc-800 text-zinc-400'
+              }`}>{v}-Ball</button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  const wins = playerMatches.filter(m => m.matchResult === 'W').length;
+  const losses = playerMatches.filter(m => m.matchResult === 'L').length;
+  const total = wins + losses;
+  const winPct = total ? Math.round((wins / total) * 100) : 0;
+  const ptsFor = playerMatches.reduce((s, m) => s + (m.apaPointsFor || 0), 0);
+  const ptsAgainst = playerMatches.reduce((s, m) => s + (m.apaPointsAgainst || 0), 0);
+  const diff = ptsFor - ptsAgainst;
+  const closeMs = playerMatches.filter(m => m.closeMatch);
+  const closeWins = closeMs.filter(m => m.matchResult === 'W').length;
+  const closePct = closeMs.length ? Math.round((closeWins / closeMs.length) * 100) : null;
+
+  // Current SL = most recent matches's playerSL
+  const sorted = playerMatches.slice().sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  const currentSL = sorted[0]?.playerSL ?? '—';
+
+  // Last 5 trend
+  const last5 = sorted.slice(0, 5);
+  const last5Wins = last5.filter(m => m.matchResult === 'W').length;
+  const last5Pct = last5.length ? Math.round((last5Wins / last5.length) * 100) : 0;
+  let trend = 'Steady';
+  if (last5.length >= 3) {
+    if (last5Pct >= 60 && winPct < 50) trend = 'Heating up';
+    else if (last5Pct <= 20 && winPct > 35) trend = 'Cooling off';
+  }
+
+  // Opponent SL breakdown
+  const oppRange = format === '8' ? [2,3,4,5,6,7] : [1,2,3,4,5,6,7,8,9];
+  const oppBreakdown = oppRange.map(sl => {
+    const ms = playerMatches.filter(m => m.oppSL === sl);
+    const w = ms.filter(m => m.matchResult === 'W').length;
+    return { sl, matches: ms.length, wins: w, pct: ms.length ? Math.round((w / ms.length) * 100) : null };
+  }).filter(r => r.matches > 0 || (format === '8' && r.sl >= 2 && r.sl <= 7));
+
+  const tags = generateCoachTags(playerMatches, format);
+
+  return (
+    <>
+      {/* Format toggle */}
+      <div className="flex gap-2 mb-4">
+        {['8','9'].map(v => (
+          <button key={v} onClick={() => setFormat(v)}
+            className={`pill-toggle flex-1 py-2 rounded-lg font-medium text-sm ${
+              format === v ? 'bg-cyan-400 text-zinc-900' : 'bg-zinc-900 border border-zinc-800 text-zinc-400'
+            }`}>{v}-Ball</button>
+        ))}
+      </div>
+
+      {playerName && <p className="text-xs text-zinc-500 mb-3">Showing {playerName} · {total} match{total === 1 ? '' : 'es'}</p>}
+
+      {/* Top metric cards */}
+      <div className="grid grid-cols-2 gap-2 mb-4">
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3">
+          <div className="text-xs text-zinc-500 mb-0.5">Current SL</div>
+          <div className="mono text-2xl font-semibold">{currentSL}</div>
+        </div>
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3">
+          <div className="text-xs text-zinc-500 mb-0.5">Win %</div>
+          <div className="mono text-2xl font-semibold accent">{winPct}%</div>
+          <div className="text-xs text-zinc-600 mono mt-0.5">{wins}W · {losses}L</div>
+        </div>
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3">
+          <div className="text-xs text-zinc-500 mb-0.5">APA pt diff</div>
+          <div className={`mono text-2xl font-semibold ${diff >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+            {diff >= 0 ? '+' : ''}{diff}
+          </div>
+          <div className="text-xs text-zinc-600 mono mt-0.5">{ptsFor} for · {ptsAgainst} ag</div>
+        </div>
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3">
+          <div className="text-xs text-zinc-500 mb-0.5">Close match %</div>
+          <div className={`mono text-2xl font-semibold ${
+            closePct == null ? 'text-zinc-600' : closePct >= 50 ? 'accent' : 'text-red-400'
+          }`}>{closePct == null ? '—' : `${closePct}%`}</div>
+          <div className="text-xs text-zinc-600 mono mt-0.5">
+            {closeMs.length ? `${closeWins}W · ${closeMs.length - closeWins}L` : 'none yet'}
+          </div>
+        </div>
+      </div>
+
+      {/* Trend + Last 5 */}
+      <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3.5 mb-3">
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-xs uppercase tracking-wider text-zinc-400 font-semibold">Last 5</div>
+          <span className={`text-xs font-semibold px-2 py-0.5 rounded ${
+            trend === 'Heating up' ? 'bg-green-400/20 text-green-400' :
+            trend === 'Cooling off' ? 'bg-red-400/20 text-red-400' :
+            'bg-zinc-800 text-zinc-400'
+          }`}>{trend}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          {last5.length === 0 ? (
+            <span className="text-xs text-zinc-500">No matches yet</span>
+          ) : (
+            <>
+              {last5.map((m, i) => (
+                <span key={i} className={`w-9 h-9 rounded-lg text-sm font-bold mono flex items-center justify-center ${
+                  m.matchResult === 'W' ? 'bg-green-400/20 text-green-400' : 'bg-red-400/20 text-red-400'
+                }`}>{m.matchResult}</span>
+              ))}
+              {Array.from({length: 5 - last5.length}).map((_, i) => (
+                <span key={`e${i}`} className="w-9 h-9 rounded-lg bg-zinc-900 border border-zinc-800"></span>
+              ))}
+              <span className="ml-auto text-xs mono text-zinc-400">{last5Pct}%</span>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Coach read */}
+      {tags.length > 0 && (
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3.5 mb-3">
+          <div className="text-xs uppercase tracking-wider text-zinc-400 font-semibold mb-2">Coach read</div>
+          <div className="space-y-1.5">
+            {tags.map((t, i) => {
+              const color = t.kind === 'risk' ? 'text-red-400' : t.kind === 'strength' ? 'text-green-400' : 'text-cyan-400';
+              const icon = t.kind === 'risk' ? '⚠' : t.kind === 'strength' ? '✓' : 'ⓘ';
+              return (
+                <div key={i} className="flex items-start gap-2 text-xs">
+                  <span className={`${color} mt-0.5`}>{icon}</span>
+                  <span className="text-zinc-500 mr-1">{t.label}:</span>
+                  <span className="text-zinc-200 flex-1">{t.text}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Opponent SL breakdown */}
+      <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3.5 mb-3">
+        <div className="text-xs uppercase tracking-wider text-zinc-400 font-semibold mb-3">Matchup by opp SL</div>
+        <div className="space-y-2">
+          {oppBreakdown.map(r => (
+            <div key={r.sl} className="grid grid-cols-[40px_1fr_70px] gap-3 items-center">
+              <span className="text-xs text-zinc-400 mono">SL{r.sl}</span>
+              <div className="h-2 bg-zinc-950 rounded-full overflow-hidden">
+                {r.matches > 0 && (
+                  <div className={`h-full ${
+                    r.pct >= 50 ? 'bg-green-400' : r.pct >= 25 ? 'bg-amber-400' : 'bg-red-400'
+                  }`} style={{width: `${r.pct}%`}} />
+                )}
+              </div>
+              <span className="text-xs mono text-right">
+                {r.matches === 0 ? <span className="text-zinc-600">—</span> :
+                  <><span className="font-semibold">{r.pct}%</span> <span className="text-zinc-500">{r.wins}/{r.matches}</span></>
+                }
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </>
+  );
+};
+
+// ============= Import from Excel =============
+
+const ImportXlsx = ({ matches, setMatches, onDone }) => {
+  const [preview, setPreview] = useState(null);
+  const [error, setError] = useState('');
+
+  const parseFile = (file) => {
+    setError('');
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(e.target.result, { type: 'array', cellDates: true });
+        const imported = [];
+
+        // Match_Log_8B
+        if (wb.SheetNames.includes('Match_Log_8B')) {
+          const rows = XLSX.utils.sheet_to_json(wb.Sheets['Match_Log_8B'], { defval: null });
+          rows.forEach(r => {
+            if (!r['Date'] || !r['Your SL']) return;
+            const gamesWon = Number(r['Games You Won']) || 0;
+            const gamesOppWon = Number(r['Games Opponent Won']) || 0;
+            const raceYou = EIGHT_BALL_RACE[r['Your SL']]?.[r['Opponent SL']] ?? 0;
+            const raceOpp = EIGHT_BALL_RACE[r['Opponent SL']]?.[r['Your SL']] ?? 0;
+            const result = (r['Match Result'] || '').toString().toUpperCase().startsWith('W') ? 'W' :
+                          (r['Match Result'] || '').toString().toUpperCase().startsWith('L') ? 'L' : '—';
+            imported.push({
+              id: uid(),
+              savedAt: new Date().toISOString(),
+              format: '8',
+              date: typeof r['Date'] === 'object' ? r['Date'].toISOString().slice(0,10) : String(r['Date']),
+              matchType: r['Match Type'] || 'League',
+              playerName: r['Player Name'] || '',
+              teamName: r['Team Name'] || '',
+              playerSL: Number(r['Your SL']) || 4,
+              oppName: r['Opponent Name'] || '',
+              oppSL: Number(r['Opponent SL']) || 4,
+              raceYou, raceOpp,
+              gamesWon, gamesOppWon,
+              matchResult: result,
+              apaPointsFor: Number(r['APA Match Points For']) || 0,
+              apaPointsAgainst: Number(r['APA Match Points Against']) || 0,
+              innings: Number(r['Total Innings']) || 0,
+              yourDefShots: Number(r['Your Defensive Shots']) || 0,
+              oppDefShots: Number(r['Opponent Defensive Shots']) || 0,
+              scratchOn8: (r['Scratch on 8'] || '').toString().toUpperCase() === 'Y' ? 1 : Number(r['Scratch on 8']) || 0,
+              eightOnBreak: (r['8 on Break'] || '').toString().toUpperCase() === 'Y' ? 1 : Number(r['8 on Break']) || 0,
+              breakAndRun: (r['Break-and-Run'] || '').toString().toUpperCase() === 'Y' ? 1 : Number(r['Break-and-Run']) || 0,
+              rackless: (r['Rackless'] || '').toString().toUpperCase() === 'Y' ? 1 : Number(r['Rackless']) || 0,
+              missedEasy: Number(r['Missed Easy Shots']) || 0,
+              missedPosition: Number(r['Missed Position Routes']) || 0,
+              poorSafety: Number(r['Poor Safety Choices']) || 0,
+              mentalFocus: Number(r['Mental Focus Rating']) || 5,
+              closeMatch: (r['Close Match'] || '').toString().toUpperCase() === 'Y',
+              whatCost: r['What Cost Racks'] || '',
+              notes: r['General Notes'] || '',
+              imported: true,
+            });
+          });
+        }
+
+        // Match_Log_9B
+        if (wb.SheetNames.includes('Match_Log_9B')) {
+          const rows = XLSX.utils.sheet_to_json(wb.Sheets['Match_Log_9B'], { defval: null });
+          rows.forEach(r => {
+            if (!r['Date'] || !r['Your SL']) return;
+            const ybp = Number(r['Your Ball Points']) || 0;
+            const obp = Number(r['Opponent Ball Points']) || 0;
+            const raceYou = NINE_BALL_RACE[r['Your SL']] ?? 0;
+            const raceOpp = NINE_BALL_RACE[r['Opponent SL']] ?? 0;
+            const result = (r['Match Result'] || '').toString().toUpperCase().startsWith('W') ? 'W' :
+                          (r['Match Result'] || '').toString().toUpperCase().startsWith('L') ? 'L' :
+                          (ybp >= raceYou && ybp > obp) ? 'W' :
+                          (obp >= raceOpp && obp > ybp) ? 'L' : '—';
+            imported.push({
+              id: uid(),
+              savedAt: new Date().toISOString(),
+              format: '9',
+              date: typeof r['Date'] === 'object' ? r['Date'].toISOString().slice(0,10) : String(r['Date']),
+              matchType: r['Match Type'] || 'League',
+              playerName: r['Player Name'] || '',
+              teamName: r['Team Name'] || '',
+              playerSL: Number(r['Your SL']) || 5,
+              oppName: r['Opponent Name'] || '',
+              oppSL: Number(r['Opponent SL']) || 5,
+              raceYou, raceOpp,
+              yourBallPoints: ybp, oppBallPoints: obp,
+              deadBalls: Number(r['Dead Balls']) || 0,
+              racksStarted: Number(r['Racks Started']) || 0,
+              matchResult: result,
+              apaPointsFor: Number(r['APA Match Points For']) || 0,
+              apaPointsAgainst: Number(r['APA Match Points Against']) || 0,
+              innings: Number(r['Total Innings']) || 0,
+              yourDefShots: Number(r['Your Defensive Shots']) || 0,
+              oppDefShots: Number(r['Opponent Defensive Shots']) || 0,
+              nineOnSnap: Number(r['Your 9-on-Snap']) || 0,
+              breakAndRun: Number(r['Your Break-and-Run']) || 0,
+              closeMatch: (r['Close Match'] || '').toString().toUpperCase() === 'Y',
+              notes: r['General Notes'] || '',
+              imported: true,
+            });
+          });
+        }
+
+        if (imported.length === 0) {
+          setError('No matches found. Expected sheets named "Match_Log_8B" or "Match_Log_9B".');
+          return;
+        }
+        setPreview(imported);
+      } catch (err) {
+        console.error(err);
+        setError('Failed to parse Excel: ' + err.message);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  const confirm = () => {
+    setMatches([...preview, ...matches]);
+    setPreview(null);
+    onDone();
+    alert(`Imported ${preview.length} matches`);
+  };
+
+  return (
+    <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-4 mb-4">
+      {!preview ? (
+        <>
+          <p className="text-sm text-zinc-300 mb-1">Import from APA tracker .xlsx</p>
+          <p className="text-xs text-zinc-500 mb-3">Reads sheets named <span className="mono text-zinc-400">Match_Log_8B</span> and <span className="mono text-zinc-400">Match_Log_9B</span></p>
+          <input type="file" accept=".xlsx,.xlsm"
+            onChange={e => e.target.files[0] && parseFile(e.target.files[0])}
+            className="text-xs text-zinc-400 file:mr-2 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-cyan-400 file:text-zinc-900 file:font-semibold" />
+          {error && <p className="text-xs text-red-400 mt-2">{error}</p>}
+        </>
+      ) : (
+        <>
+          <p className="text-sm text-zinc-200 mb-1">Found <span className="font-semibold accent">{preview.length}</span> matches</p>
+          <div className="text-xs text-zinc-500 mb-3">
+            {preview.filter(m => m.format === '8').length} 8-Ball · {preview.filter(m => m.format === '9').length} 9-Ball
+          </div>
+          <div className="bg-zinc-950 rounded-lg p-2 mb-3 max-h-32 overflow-y-auto space-y-1">
+            {preview.slice(0, 5).map((m, i) => (
+              <div key={i} className="text-xs text-zinc-400 mono flex items-center gap-2">
+                <span className={m.matchResult === 'W' ? 'text-green-400' : 'text-red-400'}>{m.matchResult}</span>
+                <span>{m.format}B</span>
+                <span className="text-zinc-500">{m.date}</span>
+                <span className="text-zinc-300 truncate">vs {m.oppName}</span>
+              </div>
+            ))}
+            {preview.length > 5 && <p className="text-xs text-zinc-600 text-center">+ {preview.length - 5} more</p>}
+          </div>
+          <div className="flex gap-2">
+            <button onClick={confirm} className="flex-1 bg-cyan-400 text-zinc-900 py-2 rounded-lg font-semibold text-sm">
+              Confirm import
+            </button>
+            <button onClick={() => setPreview(null)} className="stepper-btn px-4 py-2 rounded-lg text-sm">
+              Cancel
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+// ============= vs Opponent =============
+
+const VsOpponent = ({ roster, matches, teamName, format, setFormat }) => {
+  const slCount = format === '8' ? 6 : 9;
+  const slRange = format === '8' ? [2,3,4,5,6,7] : [1,2,3,4,5,6,7,8,9];
+  const [oppSlots, setOppSlots] = useState(() => Array(5).fill(null));
+
+  // Pick the best matchup for each opp slot under 23-rule (8B only)
+  const recommendation = useMemo(() => {
+    if (roster.length === 0) return null;
+    const slKey = format === '8' ? 'sl8' : 'sl9';
+    const filledOpps = oppSlots.map((sl, i) => ({ sl, i })).filter(o => o.sl != null);
+    if (filledOpps.length === 0) return null;
+
+    // For each opp, score each roster player
+    const scores = {}; // playerName -> [{oppIdx, score, info}]
+    roster.forEach(p => {
+      if (p[slKey] == null) return;
+      scores[p.name] = filledOpps.map(o => {
+        const wp = winPctVsSL(matches, p.name, teamName, format, o.sl);
+        // Base score: actual win % if we have data, else SL advantage heuristic
+        let base;
+        if (wp) {
+          base = wp.pct + Math.min(wp.n * 2, 20); // bias toward sample size
+        } else {
+          // SL-based heuristic: easier opp = higher score
+          const slDiff = o.sl - p[slKey];
+          base = 50 + slDiff * 8;
+        }
+        return { oppIdx: o.i, score: base, info: wp };
+      });
+    });
+
+    // Greedy assignment under 23-rule (8B)
+    const limit = format === '8' ? APA_8B_TEAM_LIMIT : 999;
+    const assigned = {}; // oppIdx -> playerName
+    const used = new Set();
+    let slUsed = 0;
+    // Sort all (player, opp) pairs by score descending
+    const pairs = [];
+    Object.entries(scores).forEach(([name, arr]) => {
+      arr.forEach(s => pairs.push({ name, ...s }));
+    });
+    pairs.sort((a, b) => b.score - a.score);
+    for (const pr of pairs) {
+      if (assigned[pr.oppIdx] !== undefined) continue;
+      if (used.has(pr.name)) continue;
+      const player = roster.find(p => p.name === pr.name);
+      const sl = player?.[slKey] ?? 0;
+      if (slUsed + sl > limit) continue;
+      assigned[pr.oppIdx] = pr.name;
+      used.add(pr.name);
+      slUsed += sl;
+    }
+    return { assigned, slUsed };
+  }, [roster, oppSlots, format, matches, teamName]);
+
+  const setOpp = (idx, sl) => setOppSlots(oppSlots.map((s, i) => i === idx ? (s === sl ? null : sl) : s));
+  const clear = () => setOppSlots(Array(5).fill(null));
+
+  return (
+    <>
+      <div className="flex gap-2 mb-4">
+        {['8','9'].map(v => (
+          <button key={v} onClick={() => setFormat(v)}
+            className={`pill-toggle flex-1 py-2 rounded-lg font-medium text-sm ${
+              format === v ? 'bg-cyan-400 text-zinc-900' : 'bg-zinc-900 border border-zinc-800 text-zinc-400'
+            }`}>{v}-Ball</button>
+        ))}
+      </div>
+
+      <p className="text-xs text-zinc-500 mb-3">Tap an SL for each opposing slot — we'll suggest your best matchup.</p>
+
+      <div className="space-y-2 mb-4">
+        {oppSlots.map((sl, idx) => {
+          const recName = recommendation?.assigned[idx];
+          const recPlayer = recName ? roster.find(r => r.name === recName) : null;
+          const slKey = format === '8' ? 'sl8' : 'sl9';
+          const wp = (recPlayer && sl != null) ? winPctVsSL(matches, recPlayer.name, teamName, format, sl) : null;
+          return (
+            <div key={idx} className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs text-zinc-400">Opp slot {idx + 1}</span>
+                {sl && <span className="text-xs mono text-zinc-300">SL{sl}</span>}
+              </div>
+              <div className="flex gap-1 flex-wrap mb-2">
+                {slRange.map(n => (
+                  <button key={n} onClick={() => setOpp(idx, n)}
+                    className={`w-8 h-8 rounded text-xs mono font-semibold ${
+                      sl === n ? 'bg-cyan-400 text-zinc-900' : 'bg-zinc-800 text-zinc-400'
+                    }`}>{n}</button>
+                ))}
+              </div>
+              {sl != null && (
+                <div className="pt-2 border-t border-zinc-800/60 flex items-center gap-2 text-xs">
+                  <span className="text-zinc-500">Send →</span>
+                  {recPlayer ? (
+                    <>
+                      <span className="font-medium flex-1">{recPlayer.name}</span>
+                      <span className="text-zinc-400 mono">SL{recPlayer[slKey] ?? '?'}</span>
+                      {wp ? (
+                        <span className={`mono font-semibold ${wp.pct >= 50 ? 'text-green-400' : wp.pct >= 25 ? 'text-amber-400' : 'text-red-400'}`}>
+                          {wp.pct}% <span className="text-zinc-600">({wp.n})</span>
+                        </span>
+                      ) : (
+                        <span className="text-zinc-500">no history</span>
+                      )}
+                    </>
+                  ) : (
+                    <span className="text-zinc-500 italic">No fit under 23-rule</span>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {recommendation && (
+        <div className={`p-3 rounded-xl border mb-3 ${
+          format === '8' && recommendation.slUsed > APA_8B_TEAM_LIMIT
+            ? 'bg-red-400/10 border-red-400/40'
+            : 'bg-zinc-900/50 border-zinc-800'
+        }`}>
+          <div className="flex items-baseline justify-between">
+            <span className="text-xs uppercase tracking-wider text-zinc-400 font-semibold">Suggested lineup SL</span>
+            <span className="mono text-xl font-bold accent">
+              {recommendation.slUsed} {format === '8' && '/ 23'}
+            </span>
+          </div>
+        </div>
+      )}
+
+      <button onClick={clear} className="w-full stepper-btn py-2.5 rounded-lg text-sm">Clear</button>
+    </>
+  );
+};
+
+// ============= Settings =============
+
+const SettingsView = ({ profile, setProfile }) => {
+  const [name, setName] = useState(profile.name || '');
+  const [team, setTeam] = useState(profile.team || '');
+  const [role, setRole] = useState(profile.role || 'player');
+  const [dues, setDues] = useState(profile.dues || DEFAULT_DUES);
+  const [savedFlash, setSavedFlash] = useState(false);
+
+  const save = () => {
+    setProfile({ name: name.trim(), team: team.trim(), role, dues: Number(dues) || DEFAULT_DUES });
+    setSavedFlash(true);
+    setTimeout(() => setSavedFlash(false), 1500);
+  };
+
+  const wipeAll = () => {
+    if (!confirm('Erase ALL data — matches, sessions, payments, profile? This cannot be undone.')) return;
+    localStorage.clear();
+    location.reload();
+  };
+
+  return (
+    <>
+      <p className="text-xs uppercase tracking-wider text-zinc-400 font-semibold mb-3">Profile</p>
+      <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-4 space-y-3 mb-4">
+        <Field label="Your name">
+          <TextInput value={name} onChange={setName} placeholder="Full name" />
+        </Field>
+        <Field label="Your team">
+          <TextInput value={team} onChange={setTeam} placeholder="e.g. Bank You, Next" />
+        </Field>
+        <Field label="Role" hint={role === 'captain' ? 'Can run Night + Money' : ''}>
+          <div className="flex gap-2">
+            {[{v:'player',l:'Player'},{v:'captain',l:'Captain'}].map(o => (
+              <button key={o.v} onClick={() => setRole(o.v)}
+                className={`pill-toggle flex-1 py-2.5 rounded-lg font-medium text-sm ${
+                  role === o.v ? 'bg-cyan-400 text-zinc-900' : 'stepper-btn'
+                }`}>{o.l}</button>
+            ))}
+          </div>
+        </Field>
+        {role === 'captain' && (
+          <Field label="Per-player dues per night" hint="$ amount">
+            <div className="flex items-center gap-2">
+              <span className="mono text-zinc-400">$</span>
+              <NumStepper value={dues} onChange={setDues} min={0} max={100} step={1} />
+            </div>
+          </Field>
+        )}
+      </div>
+      <button onClick={save}
+        className="w-full bg-cyan-400 text-zinc-900 py-3 rounded-2xl font-semibold mb-2">
+        {savedFlash ? '✓ Saved' : 'Save settings'}
+      </button>
+
+      <p className="text-xs uppercase tracking-wider text-zinc-400 font-semibold mt-8 mb-3">Danger zone</p>
+      <button onClick={wipeAll}
+        className="w-full bg-zinc-900 border border-red-400/40 text-red-400 py-2.5 rounded-2xl font-medium text-sm">
+        Erase all data
+      </button>
+      <p className="text-xs text-zinc-500 mt-2">Clears matches, sessions, payments, settings — full reset.</p>
+    </>
+  );
+};
+
+// ============= Night view (live scoresheet) =============
+
+const NightView = ({ profile, matches, setMatches }) => {
+  const [sessions, setSessions] = useLocal(SESSIONS_KEY, []);
+  const [, setPayments] = useLocal(PAYMENTS_KEY, []);
+
+  // Find any in-progress session for this team, else null
+  const activeSession = sessions.find(s => s.teamName === profile.team && s.status === 'in_progress');
+  const [creating, setCreating] = useState(!activeSession);
+  const [newOpp, setNewOpp] = useState('');
+  const [newDate, setNewDate] = useState(todayISO());
+  const [newFormat, setNewFormat] = useState('8');
+  const [newVenue, setNewVenue] = useState('');
+
+  // Recent sessions (completed) for this team
+  const recentSessions = sessions
+    .filter(s => s.teamName === profile.team && s.status === 'complete')
+    .sort((a, b) => (b.date || '').localeCompare(a.date || ''))
+    .slice(0, 5);
+
+  const createSession = () => {
+    if (!newOpp.trim()) { alert('Enter opponent team name'); return; }
+    const session = {
+      id: uid(),
+      teamName: profile.team,
+      opponentTeam: newOpp.trim(),
+      date: newDate,
+      format: newFormat,
+      venue: newVenue.trim(),
+      status: 'in_progress',
+      slots: Array(5).fill(null).map((_, i) => ({
+        slot: i + 1,
+        playerName: '', playerSL: null,
+        oppName: '', oppSL: null,
+        gamesWon: 0, gamesOppWon: 0,
+        yourBallPoints: 0, oppBallPoints: 0,
+        result: '-', apaPointsFor: 0, apaPointsAgainst: 0,
+        completed: false,
+        matchId: null,
+      })),
+      createdAt: new Date().toISOString(),
+    };
+    setSessions([session, ...sessions]);
+    setCreating(false);
+  };
+
+  const updateSlot = (sessionId, slotIdx, patch) => {
+    setSessions(sessions.map(s => {
+      if (s.id !== sessionId) return s;
+      const newSlots = s.slots.map((sl, i) => i === slotIdx ? { ...sl, ...patch } : sl);
+      return { ...s, slots: newSlots };
+    }));
+  };
+
+  const computeSlotResult = (slot, fmt) => {
+    if (slot.playerSL == null || slot.oppSL == null) return { result: '-', apaFor: 0, apaAgainst: 0, raceYou: 0, raceOpp: 0 };
+    if (fmt === '8') {
+      const raceYou = EIGHT_BALL_RACE[slot.playerSL]?.[slot.oppSL] ?? 0;
+      const raceOpp = EIGHT_BALL_RACE[slot.oppSL]?.[slot.playerSL] ?? 0;
+      const win = slot.gamesWon >= raceYou && slot.gamesWon > slot.gamesOppWon;
+      const lose = slot.gamesOppWon >= raceOpp && slot.gamesOppWon > slot.gamesWon;
+      const r = win ? 'W' : lose ? 'L' : '-';
+      return {
+        result: r,
+        apaFor: r === 'W' ? computeEightBallMP(slot.gamesWon, raceYou, true) : r === 'L' ? computeEightBallMP(slot.gamesWon, raceYou, false) : 0,
+        apaAgainst: r === 'L' ? computeEightBallMP(slot.gamesOppWon, raceOpp, true) : r === 'W' ? computeEightBallMP(slot.gamesOppWon, raceOpp, false) : 0,
+        raceYou, raceOpp,
+      };
+    } else {
+      const raceYou = NINE_BALL_RACE[slot.playerSL] ?? 0;
+      const raceOpp = NINE_BALL_RACE[slot.oppSL] ?? 0;
+      const win = slot.yourBallPoints >= raceYou && slot.yourBallPoints > slot.oppBallPoints;
+      const lose = slot.oppBallPoints >= raceOpp && slot.oppBallPoints > slot.yourBallPoints;
+      const r = win ? 'W' : lose ? 'L' : '-';
+      return {
+        result: r,
+        apaFor: r !== '-' ? computeNineBallMP(slot.playerSL, slot.yourBallPoints, r === 'W') : 0,
+        apaAgainst: r !== '-' ? computeNineBallMP(slot.oppSL, slot.oppBallPoints, r === 'L') : 0,
+        raceYou, raceOpp,
+      };
+    }
+  };
+
+  const finalizeSlot = (session, slotIdx) => {
+    const slot = session.slots[slotIdx];
+    if (!slot.playerName || !slot.oppName) { alert('Need both player names'); return; }
+    const computed = computeSlotResult(slot, session.format);
+    if (computed.result === '-') { alert('Score does not reach a race target yet'); return; }
+
+    // Create a match record
+    const matchRecord = session.format === '8'
+      ? {
+          id: uid(), savedAt: new Date().toISOString(), format: '8',
+          date: session.date, matchType: 'League',
+          playerName: slot.playerName, teamName: session.teamName,
+          playerSL: slot.playerSL, oppName: slot.oppName, oppSL: slot.oppSL,
+          raceYou: computed.raceYou, raceOpp: computed.raceOpp,
+          gamesWon: slot.gamesWon, gamesOppWon: slot.gamesOppWon,
+          matchResult: computed.result,
+          apaPointsFor: computed.apaFor, apaPointsAgainst: computed.apaAgainst,
+          innings: 0, yourDefShots: 0, oppDefShots: 0,
+          scratchOn8: 0, eightOnBreak: 0, breakAndRun: 0, rackless: 0,
+          missedEasy: 0, missedPosition: 0, poorSafety: 0,
+          mentalFocus: 5, closeMatch: false, whatCost: '', notes: `Night: vs ${session.opponentTeam}`,
+          sessionId: session.id,
+        }
+      : {
+          id: uid(), savedAt: new Date().toISOString(), format: '9',
+          date: session.date, matchType: 'League',
+          playerName: slot.playerName, teamName: session.teamName,
+          playerSL: slot.playerSL, oppName: slot.oppName, oppSL: slot.oppSL,
+          raceYou: computed.raceYou, raceOpp: computed.raceOpp,
+          yourBallPoints: slot.yourBallPoints, oppBallPoints: slot.oppBallPoints,
+          deadBalls: 0, racksStarted: 0,
+          matchResult: computed.result,
+          apaPointsFor: computed.apaFor, apaPointsAgainst: computed.apaAgainst,
+          innings: 0, yourDefShots: 0, oppDefShots: 0,
+          nineOnSnap: 0, breakAndRun: 0,
+          closeMatch: false, notes: `Night: vs ${session.opponentTeam}`,
+          sessionId: session.id,
+        };
+
+    setMatches([matchRecord, ...matches]);
+
+    // Create payment entry for this player
+    setPayments(prev => [{
+      id: uid(),
+      sessionId: session.id,
+      sessionDate: session.date,
+      teamName: session.teamName,
+      playerName: slot.playerName,
+      amount: profile.dues || DEFAULT_DUES,
+      paid: false,
+      method: '',
+      paidAt: null,
+      createdAt: new Date().toISOString(),
+    }, ...prev]);
+
+    updateSlot(session.id, slotIdx, {
+      completed: true,
+      result: computed.result,
+      apaPointsFor: computed.apaFor,
+      apaPointsAgainst: computed.apaAgainst,
+      matchId: matchRecord.id,
+    });
+  };
+
+  const endNight = (sessionId) => {
+    if (!confirm('Mark this night complete?')) return;
+    setSessions(sessions.map(s => s.id === sessionId ? { ...s, status: 'complete' } : s));
+    setCreating(true);
+  };
+
+  const deleteSession = (sessionId) => {
+    if (!confirm('Delete this session? This does NOT remove already-saved matches.')) return;
+    setSessions(sessions.filter(s => s.id !== sessionId));
+  };
+
+  if (!profile.team) {
+    return (
+      <div className="text-center py-16">
+        <p className="text-zinc-400 mb-2">Set your team first</p>
+        <p className="text-zinc-600 text-sm">Go to Settings → enter team name → save.</p>
+      </div>
+    );
+  }
+
+  // === New session form ===
+  if (creating && !activeSession) {
+    return (
+      <>
+        <p className="text-xs uppercase tracking-wider text-zinc-400 font-semibold mb-3">Start a league night</p>
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-4 space-y-3 mb-4">
+          <Field label="Date">
+            <input type="date" value={newDate} onChange={e => setNewDate(e.target.value)}
+              className="field-input w-full px-3 py-2.5 rounded-lg text-base" />
+          </Field>
+          <Field label="Format">
+            <div className="flex gap-2">
+              {['8','9'].map(v => (
+                <button key={v} onClick={() => setNewFormat(v)}
+                  className={`pill-toggle flex-1 py-2.5 rounded-lg font-medium text-sm ${
+                    newFormat === v ? 'bg-cyan-400 text-zinc-900' : 'stepper-btn'
+                  }`}>{v}-Ball</button>
+              ))}
+            </div>
+          </Field>
+          <Field label="Opposing team">
+            <TextInput value={newOpp} onChange={setNewOpp} placeholder="e.g. Cue Tip Crew" />
+          </Field>
+          <Field label="Venue (optional)">
+            <TextInput value={newVenue} onChange={setNewVenue} placeholder="e.g. Bullshooters" />
+          </Field>
+        </div>
+        <button onClick={createSession}
+          className="w-full bg-cyan-400 text-zinc-900 py-3 rounded-2xl font-semibold">
+          Start night
+        </button>
+
+        {recentSessions.length > 0 && (
+          <>
+            <p className="text-xs uppercase tracking-wider text-zinc-400 font-semibold mt-8 mb-3">Recent nights</p>
+            <div className="space-y-2">
+              {recentSessions.map(s => {
+                const totalFor = s.slots.reduce((sum, sl) => sum + (sl.apaPointsFor || 0), 0);
+                const totalAg = s.slots.reduce((sum, sl) => sum + (sl.apaPointsAgainst || 0), 0);
+                const wins = s.slots.filter(sl => sl.result === 'W').length;
+                const losses = s.slots.filter(sl => sl.result === 'L').length;
+                return (
+                  <div key={s.id} className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3">
+                    <div className="flex items-baseline justify-between mb-1">
+                      <span className="text-sm font-medium">vs {s.opponentTeam}</span>
+                      <span className="text-xs mono text-zinc-500">{fmtDate(s.date)} · {s.format}B</span>
+                    </div>
+                    <div className="flex items-center gap-3 text-xs">
+                      <span className="mono"><span className={wins > losses ? 'text-green-400' : 'text-red-400'}>{wins}</span>-<span className="text-zinc-400">{losses}</span></span>
+                      <span className="mono text-zinc-500">{totalFor} / {totalAg} APA</span>
+                      <button onClick={() => deleteSession(s.id)} className="ml-auto text-zinc-600 hover:text-red-400 text-xs">Delete</button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+      </>
+    );
+  }
+
+  // === Active session view ===
+  const session = activeSession;
+  if (!session) {
+    return <div className="text-center py-12"><button onClick={() => setCreating(true)} className="bg-cyan-400 text-zinc-900 px-5 py-2.5 rounded-xl font-semibold text-sm">Start new night</button></div>;
+  }
+
+  const totalFor = session.slots.reduce((s, sl) => s + (sl.apaPointsFor || 0), 0);
+  const totalAg = session.slots.reduce((s, sl) => s + (sl.apaPointsAgainst || 0), 0);
+  const completedCount = session.slots.filter(sl => sl.completed).length;
+  const slRange = session.format === '8' ? [2,3,4,5,6,7] : [1,2,3,4,5,6,7,8,9];
+  const slUsed = session.slots
+    .filter(sl => sl.completed || sl.playerSL != null)
+    .reduce((sum, sl) => sum + (sl.playerSL || 0), 0);
+  const overLimit = session.format === '8' && slUsed > APA_8B_TEAM_LIMIT;
+
+  return (
+    <>
+      <div className="mb-4 bg-cyan-400/10 border border-cyan-400/30 rounded-2xl p-3.5">
+        <div className="flex items-baseline justify-between mb-1">
+          <p className="text-sm font-semibold text-cyan-100">vs {session.opponentTeam}</p>
+          <span className="text-xs mono text-zinc-400">{fmtDate(session.date)} · {session.format}B</span>
+        </div>
+        <div className="flex items-center gap-3 text-xs text-zinc-400">
+          {session.venue && <span>{session.venue}</span>}
+          <span>· {completedCount}/5 done</span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-3 gap-2 mb-4">
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3 text-center">
+          <div className="text-xs text-zinc-500 mb-0.5">Team APA</div>
+          <div className="mono text-lg font-semibold">
+            <span className="accent">{totalFor}</span>
+            <span className="text-zinc-600 mx-1">−</span>
+            <span className="text-zinc-400">{totalAg}</span>
+          </div>
+        </div>
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3 text-center">
+          <div className="text-xs text-zinc-500 mb-0.5">Diff</div>
+          <div className={`mono text-lg font-semibold ${
+            totalFor - totalAg > 0 ? 'text-green-400' :
+            totalFor - totalAg < 0 ? 'text-red-400' : ''
+          }`}>{totalFor - totalAg > 0 ? '+' : ''}{totalFor - totalAg}</div>
+        </div>
+        {session.format === '8' && (
+          <div className={`bg-zinc-900/50 border rounded-xl p-3 text-center ${overLimit ? 'border-red-400/50' : 'border-zinc-800'}`}>
+            <div className="text-xs text-zinc-500 mb-0.5">23-rule</div>
+            <div className={`mono text-lg font-semibold ${overLimit ? 'text-red-400' : 'accent'}`}>{slUsed}/23</div>
+          </div>
+        )}
+      </div>
+
+      <div className="space-y-2 mb-4">
+        {session.slots.map((slot, idx) => (
+          <NightSlot
+            key={idx}
+            session={session}
+            slot={slot}
+            idx={idx}
+            slRange={slRange}
+            updateSlot={(patch) => updateSlot(session.id, idx, patch)}
+            finalize={() => finalizeSlot(session, idx)}
+            computeSlotResult={computeSlotResult}
+          />
+        ))}
+      </div>
+
+      <button onClick={() => endNight(session.id)}
+        className="w-full bg-cyan-400 text-zinc-900 py-3 rounded-2xl font-semibold mb-2">
+        End night
+      </button>
+      <button onClick={() => deleteSession(session.id)}
+        className="w-full stepper-btn py-2 rounded-xl text-sm text-zinc-400">
+        Cancel & delete this night
+      </button>
+    </>
+  );
+};
+
+const NightSlot = ({ session, slot, idx, slRange, updateSlot, finalize, computeSlotResult }) => {
+  const [expanded, setExpanded] = useState(!slot.completed);
+  const computed = computeSlotResult(slot, session.format);
+  const fmt = session.format;
+
+  return (
+    <div className={`bg-zinc-900/50 border rounded-xl ${
+      slot.completed ? 'border-zinc-800' : 'border-zinc-700'
+    } overflow-hidden`}>
+      <div className="p-3">
+        <div className="flex items-center gap-2 mb-2">
+          <span className="w-6 h-6 rounded-full bg-zinc-800 text-xs mono font-semibold flex items-center justify-center text-zinc-400">{idx + 1}</span>
+          <span className={`text-sm flex-1 ${slot.playerName ? 'font-medium' : 'text-zinc-500 italic'}`}>
+            {slot.playerName || 'Tap to assign player'}
+          </span>
+          {slot.completed && (
+            <span className={`mono text-xs font-bold px-2 py-0.5 rounded ${
+              slot.result === 'W' ? 'bg-green-400/20 text-green-400' : 'bg-red-400/20 text-red-400'
+            }`}>{slot.result}</span>
+          )}
+          <button onClick={() => setExpanded(!expanded)} className="text-xs text-zinc-500">{expanded ? '−' : '+'}</button>
+        </div>
+
+        {expanded && (
+          <div className="space-y-2 pt-2 border-t border-zinc-800">
+            <div className="grid grid-cols-2 gap-2">
+              <Field label="Your player">
+                <TextInput value={slot.playerName} onChange={v => updateSlot({ playerName: v })} placeholder="Name" />
+              </Field>
+              <Field label="Your SL">
+                <select value={slot.playerSL || ''} onChange={e => updateSlot({ playerSL: Number(e.target.value) })}
+                  className="field-input w-full px-2 py-2 rounded-lg text-sm">
+                  <option value="">—</option>
+                  {slRange.map(n => <option key={n} value={n}>{n}</option>)}
+                </select>
+              </Field>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <Field label="Opp player">
+                <TextInput value={slot.oppName} onChange={v => updateSlot({ oppName: v })} placeholder="Name" />
+              </Field>
+              <Field label="Opp SL">
+                <select value={slot.oppSL || ''} onChange={e => updateSlot({ oppSL: Number(e.target.value) })}
+                  className="field-input w-full px-2 py-2 rounded-lg text-sm">
+                  <option value="">—</option>
+                  {slRange.map(n => <option key={n} value={n}>{n}</option>)}
+                </select>
+              </Field>
+            </div>
+
+            {slot.playerSL && slot.oppSL && (
+              <p className="text-xs text-zinc-500 mono">
+                Race {computed.raceYou} <span className="text-zinc-600">·</span> Opp race {computed.raceOpp}
+              </p>
+            )}
+
+            {fmt === '8' ? (
+              <div className="grid grid-cols-2 gap-2 pt-1">
+                <Field label="Games won">
+                  <NumStepper value={slot.gamesWon} onChange={v => updateSlot({ gamesWon: v })} max={20} />
+                </Field>
+                <Field label="Opp games">
+                  <NumStepper value={slot.gamesOppWon} onChange={v => updateSlot({ gamesOppWon: v })} max={20} />
+                </Field>
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 gap-2 pt-1">
+                <Field label="Your ball pts">
+                  <NumStepper value={slot.yourBallPoints} onChange={v => updateSlot({ yourBallPoints: v })} max={120} />
+                </Field>
+                <Field label="Opp ball pts">
+                  <NumStepper value={slot.oppBallPoints} onChange={v => updateSlot({ oppBallPoints: v })} max={120} />
+                </Field>
+              </div>
+            )}
+
+            {!slot.completed ? (
+              <button onClick={finalize}
+                disabled={computed.result === '-' || !slot.playerName || !slot.oppName}
+                className={`w-full py-2.5 rounded-lg font-semibold text-sm mt-2 ${
+                  computed.result !== '-' && slot.playerName && slot.oppName
+                    ? 'bg-cyan-400 text-zinc-900' : 'bg-zinc-800 text-zinc-500'
+                }`}>
+                {computed.result === '-' ? 'Awaiting score' : `Save ${computed.result} (${computed.apaFor}-${computed.apaAgainst} APA)`}
+              </button>
+            ) : (
+              <p className="text-xs text-cyan-400 mt-1 mono">✓ Saved · {slot.apaPointsFor}-{slot.apaPointsAgainst} APA</p>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// ============= Money view =============
+
+const MoneyView = ({ profile }) => {
+  const [payments, setPayments] = useLocal(PAYMENTS_KEY, []);
+  const [expanded, setExpanded] = useState(null);
+  const [methodFor, setMethodFor] = useState(null);
+
+  // Filter to current team
+  const teamPayments = payments.filter(p => p.teamName === profile.team);
+
+  // Group by player
+  const byPlayer = useMemo(() => {
+    const m = new Map();
+    teamPayments.forEach(p => {
+      if (!m.has(p.playerName)) m.set(p.playerName, { total: 0, paid: 0, outstanding: 0, items: [] });
+      const e = m.get(p.playerName);
+      e.total += p.amount;
+      if (p.paid) e.paid += p.amount;
+      else e.outstanding += p.amount;
+      e.items.push(p);
+    });
+    // Sort items by date desc
+    m.forEach(e => e.items.sort((a,b) => (b.sessionDate || '').localeCompare(a.sessionDate || '')));
+    return Array.from(m.entries())
+      .sort(([,a],[,b]) => b.outstanding - a.outstanding);
+  }, [teamPayments]);
+
+  const teamTotal = teamPayments.reduce((s, p) => s + p.amount, 0);
+  const teamPaid = teamPayments.filter(p => p.paid).reduce((s, p) => s + p.amount, 0);
+  const teamOut = teamTotal - teamPaid;
+
+  const markPaid = (paymentId, method) => {
+    setPayments(payments.map(p => p.id === paymentId
+      ? { ...p, paid: true, method: method || 'cash', paidAt: new Date().toISOString() }
+      : p
+    ));
+    setMethodFor(null);
+  };
+
+  const unmarkPaid = (paymentId) => {
+    setPayments(payments.map(p => p.id === paymentId
+      ? { ...p, paid: false, method: '', paidAt: null }
+      : p
+    ));
+  };
+
+  if (teamPayments.length === 0) {
+    return (
+      <div className="text-center py-16">
+        <div className="text-4xl mb-3 opacity-30">💵</div>
+        <p className="text-zinc-400 mb-1">No dues yet</p>
+        <p className="text-zinc-600 text-sm">Run a league night in the Night tab — dues get created automatically.</p>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="grid grid-cols-3 gap-2 mb-4">
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3 text-center">
+          <div className="text-xs text-zinc-500 mb-0.5">Total billed</div>
+          <div className="mono text-lg font-semibold">${teamTotal}</div>
+        </div>
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3 text-center">
+          <div className="text-xs text-zinc-500 mb-0.5">Collected</div>
+          <div className="mono text-lg font-semibold text-green-400">${teamPaid}</div>
+        </div>
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3 text-center">
+          <div className="text-xs text-zinc-500 mb-0.5">Outstanding</div>
+          <div className={`mono text-lg font-semibold ${teamOut > 0 ? 'text-red-400' : 'text-zinc-500'}`}>${teamOut}</div>
+        </div>
+      </div>
+
+      <p className="text-xs uppercase tracking-wider text-zinc-400 font-semibold mb-2">By player</p>
+      <div className="space-y-2">
+        {byPlayer.map(([name, e]) => {
+          const open = expanded === name;
+          return (
+            <div key={name} className="bg-zinc-900/50 border border-zinc-800 rounded-xl overflow-hidden">
+              <button onClick={() => setExpanded(open ? null : name)} className="w-full p-3 text-left active:bg-zinc-900">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium">{name}</span>
+                  <div className="flex items-center gap-3">
+                    {e.outstanding > 0 && (
+                      <span className="mono text-sm font-bold text-red-400">${e.outstanding}</span>
+                    )}
+                    {e.outstanding === 0 && (
+                      <span className="text-xs text-green-400">✓ paid up</span>
+                    )}
+                    <span className="text-xs text-zinc-500">{open ? '−' : '+'}</span>
+                  </div>
+                </div>
+                <div className="text-xs text-zinc-500 mono mt-0.5">
+                  {e.items.length} night{e.items.length === 1 ? '' : 's'} · ${e.paid} paid / ${e.total} total
+                </div>
+              </button>
+              {open && (
+                <div className="border-t border-zinc-800 p-3 bg-zinc-950/50 space-y-1.5">
+                  {e.items.map(item => (
+                    <div key={item.id}>
+                      <div className="flex items-center justify-between text-xs py-1.5">
+                        <span className="text-zinc-400 mono">{fmtDate(item.sessionDate)}</span>
+                        <span className="mono text-zinc-300">${item.amount}</span>
+                        {item.paid ? (
+                          <button onClick={() => unmarkPaid(item.id)} className="text-green-400 font-medium">
+                            ✓ {item.method || 'paid'}
+                          </button>
+                        ) : (
+                          <button onClick={() => setMethodFor(methodFor === item.id ? null : item.id)}
+                            className="text-cyan-400 font-semibold">Mark paid</button>
+                        )}
+                      </div>
+                      {methodFor === item.id && (
+                        <div className="flex gap-1.5 pb-2 pt-1">
+                          {['cash','venmo','zelle','other'].map(m => (
+                            <button key={m} onClick={() => markPaid(item.id, m)}
+                              className="flex-1 text-xs py-1.5 rounded bg-zinc-800 text-zinc-300 hover:bg-cyan-400 hover:text-zinc-900 font-medium capitalize">{m}</button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+};
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
